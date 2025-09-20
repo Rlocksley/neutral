@@ -1,0 +1,24 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libp2p = { version = "0.53", features = [
+    "tokio",
+    "tcp",
+    "rendezvous",
+    "ping",
+    "identify",
+    "noise",
+    "yamux",
+    "request-response",
+    "macros" # <-- This enables the NetworkBehaviour derive macro
+] }
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+# The compiler told us the `aio` module is gated behind a feature. This is the one.
+unsigned-varint = { version = "0.7", features = ["futures"] }

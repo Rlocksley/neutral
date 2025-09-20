@@ -1,0 +1,10 @@
+C:\Users\robry\source\neutral\target\debug\deps\quick_protobuf-17608981c3c5494c.d: C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\lib.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\errors.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\message.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\reader.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\sizeofs.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\writer.rs
+
+C:\Users\robry\source\neutral\target\debug\deps\libquick_protobuf-17608981c3c5494c.rmeta: C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\lib.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\errors.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\message.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\reader.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\sizeofs.rs C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\writer.rs
+
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\lib.rs:
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\errors.rs:
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\message.rs:
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\reader.rs:
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\sizeofs.rs:
+C:\Users\robry\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\quick-protobuf-0.8.1\src\writer.rs:
