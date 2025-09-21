@@ -1,0 +1,45 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Rust workspace",
+			"type": "shell",
+			"command": "cargo build",
+			"args": [],
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build workspace (cargo)",
+			"type": "shell",
+			"command": "cargo build",
+			"group": "build"
+		},
+		{
+			"label": "Build workspace (cargo)",
+			"type": "shell",
+			"command": "cargo build",
+			"group": "build"
+		},
+		{
+			"label": "Build workspace (cargo)",
+			"type": "shell",
+			"command": "cargo build",
+			"group": "build"
+		},
+		{
+			"label": "Build workspace (cargo)",
+			"type": "shell",
+			"command": "cargo build",
+			"group": "build"
+		},
+		{
+			"label": "Cargo update quick-xml",
+			"type": "shell",
+			"command": "cargo update -p quick-xml",
+			"group": "build"
+		}
+	]
+}

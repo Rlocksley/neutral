@@ -22,3 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 # The compiler told us the `aio` module is gated behind a feature. This is the one.
 unsigned-varint = { version = "0.7", features = ["futures"] }
+serde = { version = "1.0", features = ["derive"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+sha2 = "0.10"
+hex = "0.4"

@@ -1,14 +1,14 @@
-    use async_trait::async_trait;
-    use futures::{prelude::*, StreamExt};
-    use libp2p::{
-        identify, noise, ping, rendezvous, request_response,
-        swarm::{NetworkBehaviour, SwarmEvent},
-        tcp, yamux, Multiaddr, PeerId,
-    };
-    use std::{collections::{HashMap, HashSet}, io, str::FromStr};
-    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-    use tracing_subscriber::EnvFilter;
-    use eframe::egui;
+use async_trait::async_trait;
+use futures::{prelude::*, StreamExt};
+use libp2p::{
+    identify, noise, ping, rendezvous, request_response,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId,
+};
+use std::{collections::{HashMap, HashSet}, io, str::FromStr};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing_subscriber::EnvFilter;
+use eframe::egui;
 
     // ---- UI Theme & Sizing ------------------------------------------------------
     // Assumptions:
@@ -150,12 +150,94 @@
             io.flush().await
         }
     }
+    // --- Auth Protocol Definition ---
+    #[derive(Debug, Clone)]
+    struct AuthProtocol();
+
+    #[derive(Default, Clone)]
+    struct AuthCodec();
+
+    impl AsRef<str> for AuthProtocol {
+        fn as_ref(&self) -> &str { 
+            "/auth/1.0" 
+        }
+    }
+
+    #[async_trait]
+    impl request_response::Codec for AuthCodec {
+        type Protocol = AuthProtocol;
+        type Request = String;
+        type Response = String;
+
+        async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let len = unsigned_varint::aio::read_u16(&mut *io)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut buffer = vec![0; len as usize];
+            io.read_exact(&mut buffer).await?;
+            Ok(String::from_utf8(buffer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let len = unsigned_varint::aio::read_u16(&mut *io)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut buffer = vec![0; len as usize];
+            io.read_exact(&mut buffer).await?;
+            Ok(String::from_utf8(buffer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let mut uvi_buf = unsigned_varint::encode::u16_buffer();
+            let encoded_len = unsigned_varint::encode::u16(req.len() as u16, &mut uvi_buf);
+
+            io.write_all(encoded_len).await?;
+            io.write_all(req.as_bytes()).await?;
+            io.flush().await
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            res: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let mut uvi_buf = unsigned_varint::encode::u16_buffer();
+            let encoded_len = unsigned_varint::encode::u16(res.len() as u16, &mut uvi_buf);
+
+            io.write_all(encoded_len).await?;
+            io.write_all(res.as_bytes()).await?;
+            io.flush().await
+        }
+    }
     // Messages from UI to networking task
     #[derive(Debug, Clone)]
     enum UiToNet {
         Connect { peer_id: String },
         Write { peer_id: String, msg: String },
-        Disconnect { peer_id: String },
+        Register { username: String, password: String, birthdate: String },
+        Login { username: String, password: String },
     }
 
     // Messages from networking task to UI
@@ -167,6 +249,7 @@
         Incoming { from: String, text: String },
         Info(String),
         Error(String),
+        AuthResult { ok: bool, message: String },
     }
 
     fn main() -> eframe::Result<()> {
@@ -177,6 +260,16 @@
             )
             .try_init();
 
+    // Optional CLI: rendezvous server ip:port (defaults to 127.0.0.1:62649)
+    let rendezvous_arg = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:62649".to_string());
+    let (rv_ip, rv_port) = match rendezvous_arg.split_once(':') {
+        Some((ip, port)) if !ip.is_empty() && !port.is_empty() => (ip.to_string(), port.to_string()),
+        _ => ("127.0.0.1".to_string(), "62649".to_string()),
+    };
+    let rendezvous_multiaddr: Multiaddr = format!("/ip4/{}/tcp/{}", rv_ip, rv_port)
+        .parse()
+        .unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/62649".parse().unwrap());
+
     // Build a Tokio runtime for networking and keep it alive for app lifetime
     let rt = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime"));
 
@@ -185,7 +278,7 @@
         let (net_to_ui_tx, net_to_ui_rx) = tokio::sync::mpsc::unbounded_channel::<NetToUi>();
 
     // Spawn networking task
-    rt.spawn(network_task(ui_to_net_rx, net_to_ui_tx));
+    rt.spawn(network_task(ui_to_net_rx, net_to_ui_tx, rendezvous_multiaddr.clone()));
 
         // Keep runtime alive by holding it in scope while UI runs
         let native_options = eframe::NativeOptions::default();
@@ -211,19 +304,41 @@
         message_input: String,
         chat_log: Vec<(String, String)>, // (from, text)
         status: String,
+        // Login state
+        logged_in: bool,
+        username: String,
+        username_input: String,
+        password_input: String,
+        auth_feedback: String,
+        // Register page state
+        page: Page,
+        reg_username: String,
+        reg_password: String,
+        // Birthdate parts for a structured chooser
+        reg_birth_year: i32,
+        reg_birth_month: u32, // 1-12
+        reg_birth_day: u32,   // 1..=days_in_month
     }
+
+    // UI pages
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Page { Login, Register }
 
     impl ChatApp {
         fn new(tx: UnboundedSender<UiToNet>, rx: UnboundedReceiver<NetToUi>, rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
             Self {
-                tx,
-                rx,
-                _rt: rt,
-                known_peers: Vec::new(),
-                selected_peer_index: None,
-                message_input: String::new(),
-                chat_log: Vec::new(),
-                status: String::from("Ready"),
+                tx, rx, _rt: rt,
+                known_peers: Vec::new(), selected_peer_index: None,
+                message_input: String::new(), chat_log: Vec::new(),
+                status: String::from("Please login or register"), logged_in: false,
+                username: String::new(), username_input: String::new(), password_input: String::new(),
+                auth_feedback: String::new(),
+                page: Page::Login,
+                reg_username: String::new(), reg_password: String::new(),
+                // Sensible defaults
+                reg_birth_year: 2000,
+                reg_birth_month: 1,
+                reg_birth_day: 1,
             }
         }
     }
@@ -257,7 +372,189 @@
                     }
                     NetToUi::Info(s) => self.status = s,
                     NetToUi::Error(e) => self.status = format!("Error: {}", e),
+                    NetToUi::AuthResult { ok, message } => {
+                        if ok {
+                            self.logged_in = true;
+                            self.username = if self.page == Page::Register {
+                                self.reg_username.clone()
+                            } else {
+                                self.username_input.clone()
+                            };
+                            self.status = format!("Logged in as {}", self.username);
+                            self.auth_feedback.clear();
+                        } else {
+                            self.auth_feedback = message;
+                        }
+                        ctx.request_repaint();
+                    }
                 }
+            }
+
+            // Login/Register gate UI
+            if !self.logged_in {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(32.0);
+                        match self.page {
+                            Page::Login => {
+                                ui.heading("Login");
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.username_input)
+                                        .hint_text("Username")
+                                        .desired_width(360.0)
+                                );
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.password_input)
+                                        .hint_text("Password")
+                                        .password(true)
+                                        .desired_width(360.0)
+                                );
+                                ui.add_space(10.0);
+                                // Manually center the buttons within a fixed-width container
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                    ui.set_width(360.0); // Match the width of the text inputs
+                                    ui.horizontal(|ui| {
+                                        // Calculate padding to center the buttons
+                                        let button_width = BUTTON_WIDTH * 2.0 + ui.spacing().item_spacing.x;
+                                        let padding = (ui.available_width() - button_width) / 2.0;
+                                        ui.add_space(padding);
+
+                                        let login = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Login")).clicked();
+                                        let register = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Register")).clicked();
+
+                                        if login {
+                                            if self.username_input.trim().is_empty() || self.password_input.is_empty() {
+                                                self.auth_feedback = "Username and password required".to_string();
+                                            } else {
+                                                let _ = self.tx.send(UiToNet::Login { username: self.username_input.trim().to_string(), password: self.password_input.clone() });
+                                                self.auth_feedback = "Logging in...".to_string();
+                                            }
+                                        }
+                                        if register {
+                                            self.page = Page::Register;
+                                            self.reg_username = self.username_input.clone();
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                if !self.auth_feedback.is_empty() { ui.colored_label(egui::Color32::YELLOW, &self.auth_feedback); }
+                            }
+                            Page::Register => {
+                                ui.heading("Register");
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.reg_username)
+                                        .hint_text("Username")
+                                        .desired_width(360.0)
+                                );
+                                ui.add_space(6.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.reg_password)
+                                        .hint_text("Password")
+                                        .password(true)
+                                        .desired_width(360.0)
+                                );
+                                // Pull birthdate row closer to password field
+                                ui.add_space(2.0);
+                                // Center the birthdate chooser inside a 360px container (symmetric around vertical axis)
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                    ui.set_width(360.0);
+                                    // Use consistent widths per dropdown so the row is symmetric
+                                    ui.horizontal(|ui| {
+                                        let combo_w: f32 = 110.0;
+                                        let total = combo_w * 3.0 + 2.0 * ui.spacing().item_spacing.x;
+                                        let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
+                                        ui.add_space(left_pad);
+                                        // Year selector (1900..=2025)
+                                        egui::ComboBox::from_id_source("year_combo").width(combo_w)
+                                            .selected_text(format!("Year: {}", self.reg_birth_year))
+                                            .show_ui(ui, |ui| {
+                                                for y in (1900..=2025).rev() {
+                                                    if ui.selectable_label(self.reg_birth_year == y, y.to_string()).clicked() {
+                                                        self.reg_birth_year = y;
+                                                        // Clamp day when year changes (for Feb/leap year)
+                                                        let max_day = days_in_month(self.reg_birth_year, self.reg_birth_month);
+                                                        if self.reg_birth_day > max_day { self.reg_birth_day = max_day; }
+                                                    }
+                                                }
+                                            });
+
+                                        // Month selector (1..=12)
+                                        const MONTH_NAMES: [&str; 12] = [
+                                            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                                        ];
+                                        // Compute safe index for month name (1..=12)
+                                        let month_idx = (self.reg_birth_month.clamp(1, 12) - 1) as usize;
+                                        egui::ComboBox::from_id_source("month_combo").width(combo_w)
+                                            .selected_text(format!("Month: {}", MONTH_NAMES[month_idx]))
+                                            .show_ui(ui, |ui| {
+                                                for m in 1..=12u32 {
+                                                    let label = MONTH_NAMES[m as usize - 1];
+                                                    if ui.selectable_label(self.reg_birth_month == m, label).clicked() {
+                                                        self.reg_birth_month = m;
+                                                        // Clamp day when month changes
+                                                        let max_day = days_in_month(self.reg_birth_year, self.reg_birth_month);
+                                                        if self.reg_birth_day > max_day { self.reg_birth_day = max_day; }
+                                                    }
+                                                }
+                                            });
+
+                                        // Day selector based on month/year
+                                        let max_day = days_in_month(self.reg_birth_year, self.reg_birth_month);
+                                        egui::ComboBox::from_id_source("day_combo").width(combo_w)
+                                            .selected_text(format!("Day: {}", self.reg_birth_day))
+                                            .show_ui(ui, |ui| {
+                                                for d in 1..=max_day {
+                                                    if ui.selectable_label(self.reg_birth_day == d, d.to_string()).clicked() {
+                                                        self.reg_birth_day = d;
+                                                    }
+                                                }
+                                            });
+                                    });
+                                });
+                                // Small gap before the action buttons
+                                ui.add_space(4.0);
+                                // Center action buttons inside the same 360px container, like login page
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                    ui.set_width(360.0);
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        let total = 2.0 * BUTTON_WIDTH + ui.spacing().item_spacing.x;
+                                        let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
+                                        ui.add_space(left_pad);
+                                        let submit = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Create Account")).clicked();
+                                        let back = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Back to Login")).clicked();
+                                    if submit {
+                                        // Format birthdate as YYYY-MM-DD
+                                        let birthdate = format!(
+                                            "{:04}-{:02}-{:02}",
+                                            self.reg_birth_year,
+                                            self.reg_birth_month,
+                                            self.reg_birth_day
+                                        );
+                                        if self.reg_username.trim().is_empty() || self.reg_password.is_empty() {
+                                            self.auth_feedback = "Fill all fields".to_string();
+                                        } else {
+                                            let _ = self.tx.send(UiToNet::Register {
+                                                username: self.reg_username.trim().to_string(),
+                                                password: self.reg_password.clone(),
+                                                birthdate,
+                                            });
+                                            self.auth_feedback = "Registering...".to_string();
+                                        }
+                                        }
+                                        if back { self.page = Page::Login; }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                if !self.auth_feedback.is_empty() { ui.colored_label(egui::Color32::YELLOW, &self.auth_feedback); }
+                            }
+                        }
+                    });
+                });
+                return;
             }
 
             egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -404,7 +701,7 @@
     }
 
     // --- Networking task ---
-    async fn network_task(mut rx: UnboundedReceiver<UiToNet>, tx: UnboundedSender<NetToUi>) {
+    async fn network_task(mut rx: UnboundedReceiver<UiToNet>, tx: UnboundedSender<NetToUi>, rendezvous_point_address: Multiaddr) {
         let _ = tx.send(NetToUi::Info("Starting networking...".into()));
 
         let local_key = libp2p::identity::Keypair::generate_ed25519();
@@ -423,6 +720,9 @@
                     let rr_cfg = request_response::Config::default()
                         .with_request_timeout(std::time::Duration::from_secs(30))
                         .with_max_concurrent_streams(usize::MAX);
+                    let auth_cfg = request_response::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(15))
+                        .with_max_concurrent_streams(16);
                     ClientBehaviour {
                         rendezvous: rendezvous::client::Behaviour::new(key.clone()),
                         ping: ping::Behaviour::new(ping::Config::default()),
@@ -433,6 +733,10 @@
                         request_response: request_response::Behaviour::new(
                             std::iter::once((HelloProtocol(), request_response::ProtocolSupport::Full)),
                             rr_cfg,
+                        ),
+                        auth: request_response::Behaviour::new(
+                            std::iter::once((AuthProtocol(), request_response::ProtocolSupport::Full)),
+                            auth_cfg,
                         ),
                     }
                 }) {
@@ -450,8 +754,7 @@
             let _ = tx.send(NetToUi::Error(format!("listen_on error: {}", e)));
         }
 
-        let rendezvous_point_address: Multiaddr = "/ip4/127.0.0.1/tcp/62649".parse().unwrap();
-        let rendezvous_point_peer_id = PeerId::from_str("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN").unwrap();
+    let rendezvous_point_peer_id = PeerId::from_str("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN").unwrap();
 
         if let Err(e) = swarm.dial(rendezvous_point_address.clone()) {
             let _ = tx.send(NetToUi::Error(format!("Dial rendezvous failed: {}", e)));
@@ -489,10 +792,13 @@
                                 swarm.behaviour_mut().request_response.send_request(&peer, msg);
                             } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
                         }
-                        UiToNet::Disconnect { peer_id } => {
-                            if let Ok(peer) = PeerId::from_str(&peer_id) {
-                                let _ = swarm.disconnect_peer_id(peer);
-                            } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
+                        UiToNet::Register { username, password, birthdate } => {
+                            let payload = format!("REGISTER:{}|{}|{}", username, password, birthdate);
+                            swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
+                        }
+                        UiToNet::Login { username, password } => {
+                            let payload = format!("LOGIN:{}|{}", username, password);
+                            swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
                         }
                     }
                 }
@@ -548,6 +854,7 @@
                             let list: Vec<String> = discovered.keys().map(|p| p.to_string()).collect();
                             let _ = tx.send(NetToUi::Discovered(list));
                         }
+                        // Chat RequestResponse
                         SwarmEvent::Behaviour(ClientBehaviourEvent::RequestResponse(event)) => match event {
                             request_response::Event::Message { peer, message } => {
                                 match message {
@@ -577,6 +884,20 @@
                                 tracing::debug!("Response sent to {}", peer);
                             }
                         },
+                        // Auth RequestResponse
+                        SwarmEvent::Behaviour(ClientBehaviourEvent::Auth(event)) => match event {
+                            request_response::Event::Message { peer: _, message } => {
+                                if let request_response::Message::Response { response, .. } = message {
+                                    let ok = response.starts_with("OK");
+                                    let msg = if ok { "Authenticated".to_string() } else { response.strip_prefix("ERR:").unwrap_or(&response).to_string() };
+                                    let _ = tx.send(NetToUi::AuthResult { ok, message: msg });
+                                }
+                            }
+                            request_response::Event::OutboundFailure { peer: _, error, .. } => {
+                                let _ = tx.send(NetToUi::AuthResult { ok: false, message: format!("Auth request failed: {:?}", error) });
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -601,4 +922,19 @@
         ping: ping::Behaviour,
         identify: identify::Behaviour,
         request_response: request_response::Behaviour<HelloCodec>,
+        auth: request_response::Behaviour<AuthCodec>,
+    }
+
+    // --- Utilities for Register date picker ---
+    fn is_leap_year(year: i32) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    }
+
+    fn days_in_month(year: i32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => if is_leap_year(year) { 29 } else { 28 },
+            _ => 30,
+        }
     }
