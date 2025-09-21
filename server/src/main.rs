@@ -101,7 +101,9 @@
             )
             .try_init();
 
-        let keypair = libp2p::identity::Keypair::ed25519_from_bytes([0; 32]).unwrap();
+    let keypair = libp2p::identity::Keypair::ed25519_from_bytes([0; 32]).unwrap();
+    let server_peer_id = libp2p::PeerId::from(keypair.public());
+    println!("Rendezvous server peer id: {}", server_peer_id);
 
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -122,7 +124,7 @@
                     request_response::Config::default(),
                 ),
             })?
-             .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(std::time::Duration::from_secs(2)))
+             .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
             .build();
 
         let _ = swarm.listen_on("/ip4/0.0.0.0/tcp/62649".parse().unwrap());

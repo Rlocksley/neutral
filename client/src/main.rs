@@ -5,7 +5,7 @@
         swarm::{NetworkBehaviour, SwarmEvent},
         tcp, yamux, Multiaddr, PeerId,
     };
-    use std::{error::Error, io, str::FromStr};
+    use std::{collections::{HashMap, HashSet}, error::Error, io, str::FromStr};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::mpsc;
     use tracing_subscriber::EnvFilter;
@@ -93,6 +93,85 @@
             io.flush().await
         }
     }
+    #[derive(Debug)]
+    enum UserCmd {
+        Connect { peer: PeerId },
+        Send { peer: PeerId, msg: String },
+        Disconnect { peer: PeerId },
+        Help,
+        Unknown(String),
+    }
+
+    fn parse_user_cmd(line: &str) -> UserCmd {
+        // Supported commands:
+        // connect -pId <peerId>
+        // write -pId <peerId> -m <message>
+        // disconnect -pId <peerId>
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            return UserCmd::Unknown(String::new());
+        }
+
+        // Normalize flags to lowercase for robustness
+        let lower = parts.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>();
+
+        // Helper to get value after a flag
+        let get_after = |flag: &str| -> Option<String> {
+            for i in 0..lower.len() {
+                if lower[i] == flag && i + 1 < parts.len() {
+                    return Some(parts[i + 1].to_string());
+                }
+            }
+            None
+        };
+
+        // connect -pId <peer>
+        if lower[0] == "connect" {
+            if let Some(pid_str) = get_after("-pid") {
+                if let Ok(peer) = PeerId::from_str(&pid_str) {
+                    return UserCmd::Connect { peer };
+                }
+            }
+            return UserCmd::Unknown(line.to_string());
+        }
+
+        // disconnect -pId <peer>
+        if lower[0] == "disconnect" {
+            if let Some(pid_str) = get_after("-pid") {
+                if let Ok(peer) = PeerId::from_str(&pid_str) {
+                    return UserCmd::Disconnect { peer };
+                }
+            }
+            return UserCmd::Unknown(line.to_string());
+        }
+
+        // write -pId <peer> -m <message...>
+        if lower[0] == "write" {
+            if let Some(pid_str) = get_after("-pid") {
+                if let Ok(peer) = PeerId::from_str(&pid_str) {
+                    // message may contain spaces; find index of -m and join rest
+                    let mut msg = String::new();
+                    for i in 0..lower.len() {
+                        if lower[i] == "-m" && i + 1 < parts.len() {
+                            msg = parts[i + 1..].join(" ");
+                            break;
+                        }
+                    }
+                    if !msg.is_empty() {
+                        return UserCmd::Send { peer, msg };
+                    }
+                }
+            }
+            return UserCmd::Unknown(line.to_string());
+        }
+
+        if lower[0] == "-help" || lower[0] == "--help" || lower[0] == "help" {
+            return UserCmd::Help;
+        }
+
+        UserCmd::Unknown(line.to_string())
+    }
+
     #[tokio::main]
     async fn main() -> Result<(), Box<dyn Error>> {
         let _ = tracing_subscriber::fmt()
@@ -155,26 +234,59 @@
             .dial(rendezvous_point_address.clone())
             .expect("Failed to dial rendezvous server");
 
-        let peer_to_discover: Option<PeerId> = std::env::args()
-            .nth(1)
-            .and_then(|peer_id_str| PeerId::from_str(&peer_id_str).ok());
-
-        // ---vvv--- BUG FIX: Create a mutable `chat_partner` state ---vvv---
-        let mut chat_partner: Option<PeerId> = peer_to_discover;
-        // ---^^^--- END OF FIX ---^^^---
+        // Maintain discovered peers and their multiaddrs and a set of connected peers
+        let mut discovered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        let mut connected: HashSet<PeerId> = HashSet::new();
 
         let mut is_registered = false;
 
+    println!("Type connect -pId <PeerId> to connect, write -pId <PeerId> -m <Message> to send, disconnect -pId <PeerId> to disconnect. Type -help for help.");
+
         loop {
             tokio::select! {
-                // ---vvv--- BUG FIX: Send messages to the `chat_partner` ---vvv---
                 Some(line) = rx.recv() => {
-                    if let Some(peer_id) = chat_partner {
-                        tracing::info!("Sending message: '{}' to peer {}", line, peer_id);
-                        swarm.behaviour_mut().request_response.send_request(&peer_id, line);
+                    match parse_user_cmd(&line) {
+                        UserCmd::Connect { peer } => {
+                            if peer == rendezvous_point_peer_id {
+                                println!("Cannot connect chat to rendezvous server peer id.");
+                                continue;
+                            }
+                            if let Some(addrs) = discovered.get(&peer) {
+                                for addr in addrs {
+                                    tracing::info!("Dialing {} at {}", peer, addr);
+                                    if let Err(e) = swarm.dial(addr.clone()) {
+                                        tracing::error!("Dial to {} at {} failed: {}", peer, addr, e);
+                                    }
+                                }
+                            } else {
+                                println!("Peer not in discovered list. Try again after discovery or ensure peer is running.");
+                            }
+                        }
+                        UserCmd::Send { peer, msg } => {
+                            if !connected.contains(&peer) {
+                                // Try dialing if we know an address
+                                if let Some(addrs) = discovered.get(&peer) {
+                                    for addr in addrs {
+                                        let _ = swarm.dial(addr.clone());
+                                    }
+                                }
+                            }
+                            tracing::info!("Sending message: '{}' to peer {}", msg, peer);
+                            swarm.behaviour_mut().request_response.send_request(&peer, msg);
+                        }
+                        UserCmd::Disconnect { peer } => {
+                            if let Err(e) = swarm.disconnect_peer_id(peer) {
+                                tracing::warn!("Disconnect request for {} failed: {:?}", peer, e);
+                            }
+                        }
+                        UserCmd::Help => {
+                            println!("Commands:\n  connect -pId <PeerId>\n  write -pId <PeerId> -m <Message>\n  disconnect -pId <PeerId>");
+                        }
+                        UserCmd::Unknown(_) => {
+                            println!("Unrecognized input. Type -help for usage.");
+                        }
                     }
                 }
-                // ---^^^--- END OF FIX ---^^^---
                 event = swarm.select_next_some() => {
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
@@ -183,9 +295,11 @@
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             tracing::info!("Connected to {} on {:?}", peer_id, endpoint.get_remote_address());
+                            connected.insert(peer_id);
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             tracing::info!("Disconnected from {}", peer_id);
+                            connected.remove(&peer_id);
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Identify(identify::Event::Received { peer_id, info, })) => {
                             tracing::info!("Received identify info from {}: observed address {:?}", peer_id, info.observed_addr);
@@ -204,30 +318,33 @@
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Rendezvous(rendezvous::client::Event::Registered { .. })) => {
                             tracing::info!("Successfully registered with the rendezvous server!");
                             is_registered = true;
-
-                            if peer_to_discover.is_some() {
-                                tracing::info!("Discovering peers in namespace '{}'...", RENDEZVOUS_NAMESPACE.to_string());
-                                swarm.behaviour_mut().rendezvous.discover(
-                                    Some(rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()).unwrap()),
-                                    None,
-                                    None,
-                                    rendezvous_point_peer_id
-                                );
-                            }
+                            // Always discover peers after registering
+                            tracing::info!("Discovering peers in namespace '{}'...", RENDEZVOUS_NAMESPACE.to_string());
+                            swarm.behaviour_mut().rendezvous.discover(
+                                Some(rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()).unwrap()),
+                                None,
+                                None,
+                                rendezvous_point_peer_id
+                            );
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Rendezvous(rendezvous::client::Event::Discovered { registrations, .. })) => {
-                            if let Some(target_peer_id) = peer_to_discover {
-                                for registration in registrations {
-                                    let discovered_peer = registration.record.peer_id();
-                                    if discovered_peer == target_peer_id {
-                                        tracing::info!("Discovered target peer {}", discovered_peer);
-                                        for address in registration.record.addresses() {
-                                            tracing::info!("Dialing peer {} at address {}", discovered_peer, address);
-                                            if let Err(e) = swarm.dial(address.clone()) {
-                                                tracing::error!("Failed to dial discovered peer: {}", e);
-                                            }
-                                        }
+                            // Update discovered peers map and print available peers
+                            for registration in registrations {
+                                let discovered_peer = registration.record.peer_id();
+                                if discovered_peer == local_peer_id { continue; }
+                                let entry = discovered.entry(discovered_peer).or_default();
+                                for address in registration.record.addresses() {
+                                    if !entry.contains(address) {
+                                        entry.push(address.clone());
                                     }
+                                }
+                            }
+                            if discovered.is_empty() {
+                                println!("No peers discovered yet.");
+                            } else {
+                                println!("Discovered peers:");
+                                for peer in discovered.keys() {
+                                    println!("  {}", peer);
                                 }
                             }
                         }
@@ -237,14 +354,8 @@
                                     request_response::Message::Request { request, channel, .. } => {
                                         let request_str = request.to_string();
                                         tracing::info!("Received request: '{}' from peer {}", request_str, peer);
-                                        println!("{}: {}", peer, request_str);
-
-                                        // ---vvv--- BUG FIX: Set the partner on first message ---vvv---
-                                        if chat_partner.is_none() {
-                                            tracing::info!("Setting chat partner to {}", peer);
-                                            chat_partner = Some(peer);
-                                        }
-                                        // ---^^^--- END OF FIX ---^^^---
+                                        // Print in requested format
+                                        println!(".\n.\n.\n{}\n{}\n.\n.\n.", peer, request_str);
 
                                         if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, ".".to_string()) {
                                             tracing::error!("Failed to send response: {}", e);
