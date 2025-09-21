@@ -22,3 +22,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 # The correct feature for the aio module
 unsigned-varint = { version = "0.7", features = ["futures"] }
+eframe = { version = "0.27", default-features = true, features = ["wgpu"] }
+egui = "0.27"

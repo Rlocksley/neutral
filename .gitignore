@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target/
+**/target/
+
+# Rust backups
+**/*.rs.bk
+
+# Compiled binaries/libraries (don’t commit build outputs)
+**/*.exe
+**/*.dll
+**/*.pdb
+**/*.so
+**/*.dylib
+**/*.d
+
+# Profiles / coverage
+**/*.profraw
+**/*.profdata
+
+# Logs / temp
+**/*.log
+**/*.tmp
+**/*.temp
+
+# Archives (usually generated artifacts)
+**/*.zip
+**/*.tar
+**/*.gz
+**/*.7z
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -5,10 +5,67 @@
         swarm::{NetworkBehaviour, SwarmEvent},
         tcp, yamux, Multiaddr, PeerId,
     };
-    use std::{collections::{HashMap, HashSet}, error::Error, io, str::FromStr};
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::sync::mpsc;
+    use std::{collections::{HashMap, HashSet}, io, str::FromStr};
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
     use tracing_subscriber::EnvFilter;
+    use eframe::egui;
+
+    // ---- UI Theme & Sizing ------------------------------------------------------
+    // Assumptions:
+    // - We standardize interactive widget height across the app (buttons, combo boxes, etc.).
+    // - Primary palette is blue with orange accents (no green hues).
+    // - Multiline chat input remains larger by design (not forced to the standard height).
+
+    const UI_HEIGHT: f32 = 36.0; // uniform height for interactive controls
+    const BUTTON_WIDTH: f32 = 120.0; // default button width
+    const RADIUS: f32 = 8.0; // rounded corners
+
+    fn configure_theme(ctx: &egui::Context) {
+        let blue = egui::Color32::from_rgb(25, 118, 210); // #1976D2
+        let blue_hover = egui::Color32::from_rgb(30, 136, 229); // #1E88E5
+        let blue_dark = egui::Color32::from_rgb(21, 101, 192); // #1565C0
+        let orange = egui::Color32::from_rgb(255, 152, 0); // #FF9800
+        let orange_dark = egui::Color32::from_rgb(230, 130, 0);
+
+        let mut style = egui::Style::default();
+        style.visuals = egui::Visuals::dark();
+
+        // Spacing & element sizing
+        style.spacing.interact_size = egui::vec2(0.0, UI_HEIGHT); // enforce uniform height
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 8.0);
+        style.spacing.combo_width = 220.0;
+
+        // Global rounding
+        let rounding = egui::Rounding::same(RADIUS);
+        style.visuals.widgets.noninteractive.rounding = rounding;
+        style.visuals.widgets.inactive.rounding = rounding;
+        style.visuals.widgets.hovered.rounding = rounding;
+        style.visuals.widgets.active.rounding = rounding;
+        style.visuals.widgets.open.rounding = rounding;
+
+        // Accents & selections
+        style.visuals.selection.bg_fill = blue;
+        style.visuals.selection.stroke = egui::Stroke { width: 1.0, color: orange };
+        style.visuals.hyperlink_color = blue;
+
+        // Button-esque widget visuals
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 49, 55);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke { width: 1.0, color: egui::Color32::LIGHT_GRAY };
+        style.visuals.widgets.hovered.bg_fill = blue_hover;
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke { width: 1.0, color: egui::Color32::WHITE };
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke { width: 1.0, color: blue_dark };
+        style.visuals.widgets.active.bg_fill = orange;
+        style.visuals.widgets.active.fg_stroke = egui::Stroke { width: 1.0, color: egui::Color32::WHITE };
+        style.visuals.widgets.active.bg_stroke = egui::Stroke { width: 1.0, color: orange_dark };
+
+        // Panels / backgrounds
+        style.visuals.panel_fill = egui::Color32::from_rgb(24, 27, 31);
+        style.visuals.window_fill = egui::Color32::from_rgb(22, 24, 28);
+        style.visuals.window_stroke = egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(40, 44, 50) };
+
+        ctx.set_style(style);
+    }
 
     // --- Protocol Definition (Identical to Server) ---
     const RENDEZVOUS_NAMESPACE: &str = "p2p-client";
@@ -93,197 +150,349 @@
             io.flush().await
         }
     }
-    #[derive(Debug)]
-    enum UserCmd {
-        Connect { peer: PeerId },
-        Send { peer: PeerId, msg: String },
-        Disconnect { peer: PeerId },
-        Help,
-        Unknown(String),
+    // Messages from UI to networking task
+    #[derive(Debug, Clone)]
+    enum UiToNet {
+        Connect { peer_id: String },
+        Write { peer_id: String, msg: String },
+        Disconnect { peer_id: String },
     }
 
-    fn parse_user_cmd(line: &str) -> UserCmd {
-        // Supported commands:
-        // connect -pId <peerId>
-        // write -pId <peerId> -m <message>
-        // disconnect -pId <peerId>
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            return UserCmd::Unknown(String::new());
-        }
-
-        // Normalize flags to lowercase for robustness
-        let lower = parts.iter().map(|s| s.to_ascii_lowercase()).collect::<Vec<_>>();
-
-        // Helper to get value after a flag
-        let get_after = |flag: &str| -> Option<String> {
-            for i in 0..lower.len() {
-                if lower[i] == flag && i + 1 < parts.len() {
-                    return Some(parts[i + 1].to_string());
-                }
-            }
-            None
-        };
-
-        // connect -pId <peer>
-        if lower[0] == "connect" {
-            if let Some(pid_str) = get_after("-pid") {
-                if let Ok(peer) = PeerId::from_str(&pid_str) {
-                    return UserCmd::Connect { peer };
-                }
-            }
-            return UserCmd::Unknown(line.to_string());
-        }
-
-        // disconnect -pId <peer>
-        if lower[0] == "disconnect" {
-            if let Some(pid_str) = get_after("-pid") {
-                if let Ok(peer) = PeerId::from_str(&pid_str) {
-                    return UserCmd::Disconnect { peer };
-                }
-            }
-            return UserCmd::Unknown(line.to_string());
-        }
-
-        // write -pId <peer> -m <message...>
-        if lower[0] == "write" {
-            if let Some(pid_str) = get_after("-pid") {
-                if let Ok(peer) = PeerId::from_str(&pid_str) {
-                    // message may contain spaces; find index of -m and join rest
-                    let mut msg = String::new();
-                    for i in 0..lower.len() {
-                        if lower[i] == "-m" && i + 1 < parts.len() {
-                            msg = parts[i + 1..].join(" ");
-                            break;
-                        }
-                    }
-                    if !msg.is_empty() {
-                        return UserCmd::Send { peer, msg };
-                    }
-                }
-            }
-            return UserCmd::Unknown(line.to_string());
-        }
-
-        if lower[0] == "-help" || lower[0] == "--help" || lower[0] == "help" {
-            return UserCmd::Help;
-        }
-
-        UserCmd::Unknown(line.to_string())
+    // Messages from networking task to UI
+    #[derive(Debug, Clone)]
+    enum NetToUi {
+        Discovered(Vec<String>),
+        Connected(String),
+        Disconnected(String),
+        Incoming { from: String, text: String },
+        Info(String),
+        Error(String),
     }
 
-    #[tokio::main]
-    async fn main() -> Result<(), Box<dyn Error>> {
+    fn main() -> eframe::Result<()> {
+        // Setup logging
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
             )
-            .init();
-        let local_key = libp2p::identity::Keypair::generate_ed25519();
-        let local_peer_id = PeerId::from(local_key.public());
-        tracing::info!("Local peer id: {}", local_peer_id);
-        println!("Local peer id: {}", local_peer_id);
+            .try_init();
 
-        let (tx, mut rx) = mpsc::channel(10);
+    // Build a Tokio runtime for networking and keep it alive for app lifetime
+    let rt = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime"));
 
-        tokio::spawn(async move {
-            let mut stdin = BufReader::new(tokio::io::stdin()).lines();
-            loop {
-                match stdin.next_line().await {
-                    Ok(Some(line)) => {
-                        if tx.send(line).await.is_err() {
-                            break;
+        // Create channels between UI and networking task
+        let (ui_to_net_tx, ui_to_net_rx) = tokio::sync::mpsc::unbounded_channel::<UiToNet>();
+        let (net_to_ui_tx, net_to_ui_rx) = tokio::sync::mpsc::unbounded_channel::<NetToUi>();
+
+    // Spawn networking task
+    rt.spawn(network_task(ui_to_net_rx, net_to_ui_tx));
+
+        // Keep runtime alive by holding it in scope while UI runs
+        let native_options = eframe::NativeOptions::default();
+        eframe::run_native(
+            "P2P Chat Client",
+            native_options,
+            Box::new(|cc| {
+                // Apply our theme before UI starts
+                configure_theme(&cc.egui_ctx);
+                Box::new(ChatApp::new(ui_to_net_tx, net_to_ui_rx, rt))
+            }),
+        )
+    }
+
+    // The eframe/egui application struct
+    struct ChatApp {
+        tx: UnboundedSender<UiToNet>,
+        rx: UnboundedReceiver<NetToUi>,
+        // Hold the runtime to keep it alive for as long as the UI runs
+        _rt: std::sync::Arc<tokio::runtime::Runtime>,
+        known_peers: Vec<String>,
+        selected_peer_index: Option<usize>,
+        message_input: String,
+        chat_log: Vec<(String, String)>, // (from, text)
+        status: String,
+    }
+
+    impl ChatApp {
+        fn new(tx: UnboundedSender<UiToNet>, rx: UnboundedReceiver<NetToUi>, rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
+            Self {
+                tx,
+                rx,
+                _rt: rt,
+                known_peers: Vec::new(),
+                selected_peer_index: None,
+                message_input: String::new(),
+                chat_log: Vec::new(),
+                status: String::from("Ready"),
+            }
+        }
+    }
+
+    impl eframe::App for ChatApp {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // Ensure regular repaint so incoming messages are processed promptly
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            // Drain messages from networking
+            while let Ok(msg) = self.rx.try_recv() {
+                match msg {
+                    NetToUi::Discovered(list) => {
+                        self.known_peers = list.clone();
+                        // reset selection if out of range
+                        if let Some(i) = self.selected_peer_index {
+                            if i >= self.known_peers.len() { self.selected_peer_index = None; }
                         }
+                        ctx.request_repaint();
                     }
-                    _ => {
-                        break;
+                    NetToUi::Connected(pid) => {
+                        self.status = format!("Connected: {}", pid);
+                        ctx.request_repaint();
                     }
+                    NetToUi::Disconnected(pid) => {
+                        self.status = format!("Disconnected: {}", pid);
+                        ctx.request_repaint();
+                    }
+                    NetToUi::Incoming { from, text } => {
+                        self.chat_log.push((from, text));
+                        ctx.request_repaint();
+                    }
+                    NetToUi::Info(s) => self.status = s,
+                    NetToUi::Error(e) => self.status = format!("Error: {}", e),
                 }
             }
-        });
 
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                // Top bar frame to separate from content
+                egui::Frame::none()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.label(&self.status);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Peer:");
+                            let mut selection_changed = false;
+                            egui::ComboBox::from_id_source("peer_combo")
+                                .selected_text(
+                                    self.selected_peer_index
+                                        .and_then(|i| self.known_peers.get(i).cloned())
+                                        .unwrap_or_else(|| "Select a peer".to_string()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, pid) in self.known_peers.iter().enumerate() {
+                                        if ui.selectable_label(self.selected_peer_index == Some(i), pid).clicked() {
+                                            self.selected_peer_index = Some(i);
+                                            selection_changed = true;
+                                        }
+                                    }
+                                });
+                            if selection_changed {
+                                if let Some(i) = self.selected_peer_index {
+                                    if let Some(peer_id) = self.known_peers.get(i) {
+                                        let _ = self.tx.send(UiToNet::Connect { peer_id: peer_id.clone() });
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+
+            // Bottom panel: fixed input area with text field and Send button
+            // NOTE: Panels strip space in the order they're added. Add the bottom panel BEFORE the CentralPanel
+            // so the CentralPanel gets the remaining space and won't be overlapped.
+            egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
+                // Bottom input area with spacing and rounded corners
+                egui::Frame::none()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.separator();
+                        // Right-to-left: button on right, text edit fills remaining space
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let send_clicked = ui
+                                .add_sized(
+                                    [BUTTON_WIDTH, UI_HEIGHT],
+                                    egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
+                                        .fill(egui::Color32::from_rgb(255, 152, 0)) // accent orange
+                                        .rounding(egui::Rounding::same(RADIUS))
+                                        .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(230, 130, 0) }),
+                                )
+                                .clicked();
+
+                            let text_edit = egui::TextEdit::multiline(&mut self.message_input)
+                                .desired_rows(6) // larger by design
+                                .hint_text("Type your message here...")
+                                .frame(false); // we'll draw our own background
+
+                            let inner = egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(38, 43, 50)) // stylish grey background
+                                .rounding(egui::Rounding::same(RADIUS))
+                                .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(55, 61, 69) })
+                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                .show(ui, |ui| {
+                                    ui.add_sized(ui.available_size(), text_edit)
+                                });
+                            let response = inner.inner; // Response of the TextEdit for focus
+
+                            if send_clicked {
+                                if let Some(i) = self.selected_peer_index {
+                                    if let Some(peer_id) = self.known_peers.get(i) {
+                                        if !self.message_input.is_empty() {
+                                            let _ = self.tx.send(UiToNet::Write { peer_id: peer_id.clone(), msg: self.message_input.clone() });
+                                            self.message_input.clear();
+                                            // Request focus back to the text edit after sending
+                                            ui.memory_mut(|m| m.request_focus(response.id));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+
+            // Central panel: only the scrollable chat area (with visible scrollbar and stick-to-bottom)
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Make the central panel occupy the full available width so the scroll bar sits at the edge
+                ui.set_width(ui.available_width());
+                ui.heading("Chat");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        // Ensure the inner content also uses the full width
+                        ui.set_min_width(ui.available_width());
+                        for (from, text) in &self.chat_log {
+                            let is_outgoing = from.starts_with("You to ");
+                            if is_outgoing {
+                                // Right-aligned outgoing bubble in blue, white text
+                                let row_width = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(row_width, 0.0),
+                                    egui::Layout::right_to_left(egui::Align::Min),
+                                    |ui| {
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgb(25, 118, 210))
+                                            .rounding(egui::Rounding::same(RADIUS))
+                                            .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(21, 101, 192) })
+                                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                            .show(ui, |ui| {
+                                                ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                                                    ui.colored_label(egui::Color32::WHITE, format!("{}:", from));
+                                                    ui.colored_label(egui::Color32::WHITE, text);
+                                                });
+                                            });
+                                    },
+                                );
+                            } else {
+                                // Left-aligned incoming bubble, same blue background as outgoing
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgb(25, 118, 210))
+                                    .rounding(egui::Rounding::same(RADIUS))
+                                    .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(21, 101, 192) })
+                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                    .show(ui, |ui| {
+                                        ui.colored_label(egui::Color32::WHITE, format!("{}:", from));
+                                        ui.colored_label(egui::Color32::WHITE, text);
+                                    });
+                            }
+                            ui.add_space(4.0);
+                        }
+                    });
+            });
+        }
+    }
+
+    // --- Networking task ---
+    async fn network_task(mut rx: UnboundedReceiver<UiToNet>, tx: UnboundedSender<NetToUi>) {
+        let _ = tx.send(NetToUi::Info("Starting networking...".into()));
+
+        let local_key = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
+        let _ = tx.send(NetToUi::Info(format!("Local peer id: {}", local_peer_id)));
+
+        let mut swarm = match libp2p::SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
                 noise::Config::new,
                 yamux::Config::default,
-            )?
-            .with_behaviour(|key| ClientBehaviour {
-                rendezvous: rendezvous::client::Behaviour::new(key.clone()),
-                ping: ping::Behaviour::new(ping::Config::default()),
-                identify: identify::Behaviour::new(identify::Config::new(
-                    "/p2p-client/1.0.0".to_string(),
-                    key.public(),
-                )),
-                request_response: request_response::Behaviour::new(
-                    std::iter::once((HelloProtocol(), request_response::ProtocolSupport::Full)),
-                    request_response::Config::default(),
-                ),
-            })?
-            .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
-            .build();
+            ) {
+            Ok(builder) => {
+                let builder = match builder.with_behaviour(|key| {
+                    let rr_cfg = request_response::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(30))
+                        .with_max_concurrent_streams(usize::MAX);
+                    ClientBehaviour {
+                        rendezvous: rendezvous::client::Behaviour::new(key.clone()),
+                        ping: ping::Behaviour::new(ping::Config::default()),
+                        identify: identify::Behaviour::new(identify::Config::new(
+                            "/p2p-client/1.0.0".to_string(),
+                            key.public(),
+                        )),
+                        request_response: request_response::Behaviour::new(
+                            std::iter::once((HelloProtocol(), request_response::ProtocolSupport::Full)),
+                            rr_cfg,
+                        ),
+                    }
+                }) {
+                    Ok(b) => b,
+                    Err(e) => { let _ = tx.send(NetToUi::Error(format!("Behaviour: {}", e))); return; }
+                };
+                builder
+                    .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+                    .build()
+            }
+            Err(e) => { let _ = tx.send(NetToUi::Error(format!("Transport: {}", e))); return; }
+        };
 
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        if let Err(e) = swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()) {
+            let _ = tx.send(NetToUi::Error(format!("listen_on error: {}", e)));
+        }
 
-        let rendezvous_point_address: Multiaddr = "/ip4/127.0.0.1/tcp/62649".parse()?;
-        let rendezvous_point_peer_id =
-            PeerId::from_str("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN")?;
+        let rendezvous_point_address: Multiaddr = "/ip4/127.0.0.1/tcp/62649".parse().unwrap();
+        let rendezvous_point_peer_id = PeerId::from_str("12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN").unwrap();
 
-        swarm
-            .dial(rendezvous_point_address.clone())
-            .expect("Failed to dial rendezvous server");
+        if let Err(e) = swarm.dial(rendezvous_point_address.clone()) {
+            let _ = tx.send(NetToUi::Error(format!("Dial rendezvous failed: {}", e)));
+        }
 
-        // Maintain discovered peers and their multiaddrs and a set of connected peers
         let mut discovered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
         let mut connected: HashSet<PeerId> = HashSet::new();
-
         let mut is_registered = false;
 
-    println!("Type connect -pId <PeerId> to connect, write -pId <PeerId> -m <Message> to send, disconnect -pId <PeerId> to disconnect. Type -help for help.");
-
+        // Periodic rediscovery every 5s for a more responsive UI
+        let mut rediscover_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
-                Some(line) = rx.recv() => {
-                    match parse_user_cmd(&line) {
-                        UserCmd::Connect { peer } => {
-                            if peer == rendezvous_point_peer_id {
-                                println!("Cannot connect chat to rendezvous server peer id.");
-                                continue;
-                            }
-                            if let Some(addrs) = discovered.get(&peer) {
-                                for addr in addrs {
-                                    tracing::info!("Dialing {} at {}", peer, addr);
-                                    if let Err(e) = swarm.dial(addr.clone()) {
-                                        tracing::error!("Dial to {} at {} failed: {}", peer, addr, e);
-                                    }
-                                }
-                            } else {
-                                println!("Peer not in discovered list. Try again after discovery or ensure peer is running.");
-                            }
-                        }
-                        UserCmd::Send { peer, msg } => {
-                            if !connected.contains(&peer) {
-                                // Try dialing if we know an address
+                Some(cmd) = rx.recv() => {
+                    match cmd {
+                        UiToNet::Connect { peer_id } => {
+                            if let Ok(peer) = PeerId::from_str(&peer_id) {
+                                if peer == rendezvous_point_peer_id { let _=tx.send(NetToUi::Info("Cannot connect to rendezvous server".into())); continue; }
                                 if let Some(addrs) = discovered.get(&peer) {
                                     for addr in addrs {
-                                        let _ = swarm.dial(addr.clone());
+                                        // Feed address to swarm peer address book and dial
+                                        swarm.add_peer_address(peer, addr.clone());
+                                        let _=swarm.dial(addr.clone());
                                     }
+                                } else { let _=tx.send(NetToUi::Info("Peer not discovered yet".into())); }
+                            } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
+                        }
+                        UiToNet::Write { peer_id, msg } => {
+                            if let Ok(peer) = PeerId::from_str(&peer_id) {
+                                if !connected.contains(&peer) {
+                                    if let Some(addrs) = discovered.get(&peer) { for addr in addrs { let _=swarm.dial(addr.clone()); } }
                                 }
-                            }
-                            tracing::info!("Sending message: '{}' to peer {}", msg, peer);
-                            swarm.behaviour_mut().request_response.send_request(&peer, msg);
+                                // Echo to local chat window immediately
+                                let _ = tx.send(NetToUi::Incoming { from: format!("You to {}", peer_id), text: msg.clone() });
+                                swarm.behaviour_mut().request_response.send_request(&peer, msg);
+                            } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
                         }
-                        UserCmd::Disconnect { peer } => {
-                            if let Err(e) = swarm.disconnect_peer_id(peer) {
-                                tracing::warn!("Disconnect request for {} failed: {:?}", peer, e);
-                            }
-                        }
-                        UserCmd::Help => {
-                            println!("Commands:\n  connect -pId <PeerId>\n  write -pId <PeerId> -m <Message>\n  disconnect -pId <PeerId>");
-                        }
-                        UserCmd::Unknown(_) => {
-                            println!("Unrecognized input. Type -help for usage.");
+                        UiToNet::Disconnect { peer_id } => {
+                            if let Ok(peer) = PeerId::from_str(&peer_id) {
+                                let _ = swarm.disconnect_peer_id(peer);
+                            } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
                         }
                     }
                 }
@@ -296,16 +505,16 @@
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             tracing::info!("Connected to {} on {:?}", peer_id, endpoint.get_remote_address());
                             connected.insert(peer_id);
+                            let _ = tx.send(NetToUi::Connected(peer_id.to_string()));
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             tracing::info!("Disconnected from {}", peer_id);
                             connected.remove(&peer_id);
+                            let _ = tx.send(NetToUi::Disconnected(peer_id.to_string()));
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Identify(identify::Event::Received { peer_id, info, })) => {
                             tracing::info!("Received identify info from {}: observed address {:?}", peer_id, info.observed_addr);
-
                             if peer_id == rendezvous_point_peer_id && !is_registered {
-                                tracing::info!("Identity protocol finished with rendezvous server. Registering...");
                                 if let Err(e) = swarm.behaviour_mut().rendezvous.register(
                                     rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()).unwrap(),
                                     rendezvous_point_peer_id,
@@ -316,11 +525,8 @@
                             }
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Rendezvous(rendezvous::client::Event::Registered { .. })) => {
-                            tracing::info!("Successfully registered with the rendezvous server!");
                             is_registered = true;
-                            // Always discover peers after registering
-                            tracing::info!("Discovering peers in namespace '{}'...", RENDEZVOUS_NAMESPACE.to_string());
-                            swarm.behaviour_mut().rendezvous.discover(
+                            let _ = swarm.behaviour_mut().rendezvous.discover(
                                 Some(rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()).unwrap()),
                                 None,
                                 None,
@@ -328,7 +534,6 @@
                             );
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Rendezvous(rendezvous::client::Event::Discovered { registrations, .. })) => {
-                            // Update discovered peers map and print available peers
                             for registration in registrations {
                                 let discovered_peer = registration.record.peer_id();
                                 if discovered_peer == local_peer_id { continue; }
@@ -336,44 +541,54 @@
                                 for address in registration.record.addresses() {
                                     if !entry.contains(address) {
                                         entry.push(address.clone());
+                                        swarm.add_peer_address(discovered_peer, address.clone());
                                     }
                                 }
                             }
-                            if discovered.is_empty() {
-                                println!("No peers discovered yet.");
-                            } else {
-                                println!("Discovered peers:");
-                                for peer in discovered.keys() {
-                                    println!("  {}", peer);
-                                }
-                            }
+                            let list: Vec<String> = discovered.keys().map(|p| p.to_string()).collect();
+                            let _ = tx.send(NetToUi::Discovered(list));
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::RequestResponse(event)) => match event {
                             request_response::Event::Message { peer, message } => {
                                 match message {
                                     request_response::Message::Request { request, channel, .. } => {
                                         let request_str = request.to_string();
-                                        tracing::info!("Received request: '{}' from peer {}", request_str, peer);
-                                        // Print in requested format
-                                        println!(".\n.\n.\n{}\n{}\n.\n.\n.", peer, request_str);
-
-                                        if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, ".".to_string()) {
+                                        let _ = tx.send(NetToUi::Incoming { from: peer.to_string(), text: request_str.clone() });
+                                        // Respond with a small ack so the sender gets a response per message
+                                        if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, "ok".to_string()) {
                                             tracing::error!("Failed to send response: {}", e);
                                         }
                                     }
                                     request_response::Message::Response { response, .. } => {
-                                        tracing::info!("Received response: '{}' from peer {}", response.to_string(), peer);
+                                        // Surface responses in the chat too (optional)
+                                        let _ = tx.send(NetToUi::Info(format!("Response from {}: {}", peer, response)));
                                     }
                                 }
                             }
-                            request_response::Event::OutboundFailure { peer, .. } => {
-                                tracing::error!("Outbound request to {} failed", peer);
+                            request_response::Event::OutboundFailure { peer, error, request_id: _ } => {
+                                tracing::error!("Outbound request to {} failed: {:?}", peer, error);
+                                let _ = tx.send(NetToUi::Error(format!("Outbound to {} failed: {:?}", peer, error)));
                             }
-                            _ => {}
+                            request_response::Event::InboundFailure { peer, error, request_id: _ } => {
+                                tracing::error!("Inbound with {} failed: {:?}", peer, error);
+                                let _ = tx.send(NetToUi::Error(format!("Inbound with {} failed: {:?}", peer, error)));
+                            }
+                            request_response::Event::ResponseSent { peer, .. } => {
+                                tracing::debug!("Response sent to {}", peer);
+                            }
                         },
-                        other => {
-                            tracing::debug!("Unhandled swarm event: {:?}", other);
-                        }
+                        _ => {}
+                    }
+                }
+                // Periodic rediscovery tick
+                _ = rediscover_interval.tick() => {
+                    if is_registered {
+                        let _ = swarm.behaviour_mut().rendezvous.discover(
+                            Some(rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()).unwrap()),
+                            None,
+                            None,
+                            rendezvous_point_peer_id
+                        );
                     }
                 }
             }
