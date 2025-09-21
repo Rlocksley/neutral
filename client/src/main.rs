@@ -238,6 +238,7 @@ use eframe::egui;
         Write { peer_id: String, msg: String },
         Register { username: String, password: String, birthdate: String },
         Login { username: String, password: String },
+        Logout { username: String },
     }
 
     // Messages from networking task to UI
@@ -250,6 +251,7 @@ use eframe::egui;
         Info(String),
         Error(String),
         AuthResult { ok: bool, message: String },
+        Users(HashMap<String, String>), // username -> PeerId
     }
 
     fn main() -> eframe::Result<()> {
@@ -299,8 +301,10 @@ use eframe::egui;
         rx: UnboundedReceiver<NetToUi>,
         // Hold the runtime to keep it alive for as long as the UI runs
         _rt: std::sync::Arc<tokio::runtime::Runtime>,
-        known_peers: Vec<String>,
-        selected_peer_index: Option<usize>,
+    known_peers: Vec<String>,
+    selected_peer_index: Option<usize>,
+    users: HashMap<String, String>, // username -> PeerId
+    selected_user: Option<String>,
         message_input: String,
         chat_log: Vec<(String, String)>, // (from, text)
         status: String,
@@ -329,6 +333,7 @@ use eframe::egui;
             Self {
                 tx, rx, _rt: rt,
                 known_peers: Vec::new(), selected_peer_index: None,
+                users: HashMap::new(), selected_user: None,
                 message_input: String::new(), chat_log: Vec::new(),
                 status: String::from("Please login or register"), logged_in: false,
                 username: String::new(), username_input: String::new(), password_input: String::new(),
@@ -382,8 +387,22 @@ use eframe::egui;
                             };
                             self.status = format!("Logged in as {}", self.username);
                             self.auth_feedback.clear();
+                            // Networking task will query user list via auth protocol
                         } else {
                             self.auth_feedback = message;
+                        }
+                        ctx.request_repaint();
+                    }
+                    NetToUi::Users(map) => {
+                        // Remove our own username from the directory so we can't select ourselves
+                        let mut map = map;
+                        if !self.username.is_empty() {
+                            map.remove(&self.username);
+                        }
+                        self.users = map;
+                        // reset selected if missing
+                        if let Some(name) = self.selected_user.clone() {
+                            if !self.users.contains_key(&name) { self.selected_user = None; }
                         }
                         ctx.request_repaint();
                     }
@@ -566,29 +585,24 @@ use eframe::egui;
                         ui.label(&self.status);
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.label("Peer:");
-                            let mut selection_changed = false;
-                            egui::ComboBox::from_id_source("peer_combo")
-                                .selected_text(
-                                    self.selected_peer_index
-                                        .and_then(|i| self.known_peers.get(i).cloned())
-                                        .unwrap_or_else(|| "Select a peer".to_string()),
-                                )
+                            ui.label("User:");
+                            let current = self.selected_user.clone().unwrap_or_else(|| "Select a user".to_string());
+                            egui::ComboBox::from_id_source("user_combo")
+                                .selected_text(current)
                                 .show_ui(ui, |ui| {
-                                    for (i, pid) in self.known_peers.iter().enumerate() {
-                                        if ui.selectable_label(self.selected_peer_index == Some(i), pid).clicked() {
-                                            self.selected_peer_index = Some(i);
-                                            selection_changed = true;
+                                    let mut names: Vec<String> = self.users.keys().cloned().collect();
+                                    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                                    for name in names {
+                                        let is_sel = self.selected_user.as_ref().map(|n| n == &name).unwrap_or(false);
+                                        if ui.selectable_label(is_sel, &name).clicked() {
+                                            self.selected_user = Some(name.clone());
+                                            // attempt connect immediately
+                                            if let Some(pid) = self.users.get(&name).cloned() {
+                                                let _ = self.tx.send(UiToNet::Connect { peer_id: pid });
+                                            }
                                         }
                                     }
                                 });
-                            if selection_changed {
-                                if let Some(i) = self.selected_peer_index {
-                                    if let Some(peer_id) = self.known_peers.get(i) {
-                                        let _ = self.tx.send(UiToNet::Connect { peer_id: peer_id.clone() });
-                                    }
-                                }
-                            }
                         });
                     });
             });
@@ -631,12 +645,11 @@ use eframe::egui;
                             let response = inner.inner; // Response of the TextEdit for focus
 
                             if send_clicked {
-                                if let Some(i) = self.selected_peer_index {
-                                    if let Some(peer_id) = self.known_peers.get(i) {
+                                if let Some(name) = self.selected_user.clone() {
+                                    if let Some(peer_id) = self.users.get(&name).cloned() {
                                         if !self.message_input.is_empty() {
-                                            let _ = self.tx.send(UiToNet::Write { peer_id: peer_id.clone(), msg: self.message_input.clone() });
+                                            let _ = self.tx.send(UiToNet::Write { peer_id, msg: self.message_input.clone() });
                                             self.message_input.clear();
-                                            // Request focus back to the text edit after sending
                                             ui.memory_mut(|m| m.request_focus(response.id));
                                         }
                                     }
@@ -697,6 +710,16 @@ use eframe::egui;
                         }
                     });
             });
+        }
+
+    }
+
+    impl Drop for ChatApp {
+        fn drop(&mut self) {
+            // Best-effort: attempt to inform server we're logging out.
+            if self.logged_in && !self.username.is_empty() {
+                let _ = self.tx.send(UiToNet::Logout { username: self.username.clone() });
+            }
         }
     }
 
@@ -760,12 +783,14 @@ use eframe::egui;
             let _ = tx.send(NetToUi::Error(format!("Dial rendezvous failed: {}", e)));
         }
 
-        let mut discovered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
-        let mut connected: HashSet<PeerId> = HashSet::new();
-        let mut is_registered = false;
+    let mut discovered: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    let mut connected: HashSet<PeerId> = HashSet::new();
+    let mut is_registered = false;
+    let mut is_authenticated = false;
 
         // Periodic rediscovery every 5s for a more responsive UI
-        let mut rediscover_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut rediscover_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut users_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
                 Some(cmd) = rx.recv() => {
@@ -800,6 +825,10 @@ use eframe::egui;
                             let payload = format!("LOGIN:{}|{}", username, password);
                             swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
                         }
+                        UiToNet::Logout { username } => {
+                            let payload = format!("LOGOUT:{}", username);
+                            let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
+                        }
                     }
                 }
                 event = swarm.select_next_some() => {
@@ -817,6 +846,10 @@ use eframe::egui;
                             tracing::info!("Disconnected from {}", peer_id);
                             connected.remove(&peer_id);
                             let _ = tx.send(NetToUi::Disconnected(peer_id.to_string()));
+                            // If this was the rendezvous server, clear our user list (will repopulate if we reconnect)
+                            if peer_id == rendezvous_point_peer_id {
+                                let _ = tx.send(NetToUi::Users(HashMap::new()));
+                            }
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Identify(identify::Event::Received { peer_id, info, })) => {
                             tracing::info!("Received identify info from {}: observed address {:?}", peer_id, info.observed_addr);
@@ -888,9 +921,34 @@ use eframe::egui;
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Auth(event)) => match event {
                             request_response::Event::Message { peer: _, message } => {
                                 if let request_response::Message::Response { response, .. } = message {
-                                    let ok = response.starts_with("OK");
-                                    let msg = if ok { "Authenticated".to_string() } else { response.strip_prefix("ERR:").unwrap_or(&response).to_string() };
-                                    let _ = tx.send(NetToUi::AuthResult { ok, message: msg });
+                                    if let Some(rest) = response.strip_prefix("AUTH:") {
+                                        let ok = rest.starts_with("OK");
+                                        let msg = if ok { "Authenticated".to_string() } else { rest.strip_prefix("ERR:").unwrap_or(rest).to_string() };
+                                        let _ = tx.send(NetToUi::AuthResult { ok, message: msg });
+                                        if ok {
+                                            is_authenticated = true;
+                                            // After successful auth, request the user list
+                                            // Send request through auth protocol to the rendezvous server
+                                            // We'll send from here because we have access to swarm
+                                            let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, "LIST".to_string());
+                                        }
+                                    } else if let Some(rest) = response.strip_prefix("LIST:") {
+                                        // Parse username=peerid pairs separated by commas
+                                        let mut map = HashMap::new();
+                                        if !rest.is_empty() {
+                                            for pair in rest.split(',') {
+                                                if let Some((name, pid)) = pair.split_once('=') {
+                                                    map.insert(name.to_string(), pid.to_string());
+                                                }
+                                            }
+                                        }
+                                        let _ = tx.send(NetToUi::Users(map));
+                                    } else {
+                                        // Backward-compat: older server without AUTH: prefix
+                                        let ok = response.starts_with("OK");
+                                        let msg = if ok { "Authenticated".to_string() } else { response.trim_start_matches("ERR:").to_string() };
+                                        let _ = tx.send(NetToUi::AuthResult { ok, message: msg });
+                                    }
                                 }
                             }
                             request_response::Event::OutboundFailure { peer: _, error, .. } => {
@@ -910,6 +968,12 @@ use eframe::egui;
                             None,
                             rendezvous_point_peer_id
                         );
+                    }
+                }
+                // Periodic user list refresh after authentication
+                _ = users_refresh_interval.tick() => {
+                    if is_authenticated {
+                        let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, "LIST".to_string());
                     }
                 }
             }

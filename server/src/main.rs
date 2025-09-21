@@ -241,6 +241,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!("Disconnected from {}", peer_id);
+                // Remove any usernames associated with this peer so LIST stays accurate
+                let mut removed: Vec<String> = Vec::new();
+                username_to_peer.retain(|name, pid| {
+                    let keep = *pid != peer_id;
+                    if !keep { removed.push(name.clone()); }
+                    keep
+                });
+                if !removed.is_empty() {
+                    tracing::info!("Removed usernames on disconnect: {:?}", removed);
+                }
             }
             SwarmEvent::Behaviour(MyBehaviourEvent::Rendezvous(
                 rendezvous::server::Event::PeerRegistered { peer, registration },
@@ -309,9 +319,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         users_xml.users.push(UserXml { username: name.clone(), password_hash: pw_hash, birthdate: dob, peer_id: None });
                                         save_users(users_path, &users_xml);
                                         username_to_peer.insert(name, peer);
-                                        "OK".to_string()
+                                        "AUTH:OK".to_string()
                                     }
-                                    Some(_) => "ERR:Username taken".to_string(),
+                                    Some(_) => "AUTH:ERR:Username taken".to_string(),
                                 }
                             }
                         } else if let Some(rest) = text.strip_prefix("LOGIN:") {
@@ -324,19 +334,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     Some((hash, _dob)) => {
                                         if *hash == hash_password(pw) {
                                             match username_to_peer.get(name) {
-                                                Some(pid) if *pid == peer => "OK".to_string(),
-                                                Some(_) => "ERR:Username belongs to another peer".to_string(),
-                                                None => { username_to_peer.insert(name.to_string(), peer); "OK".to_string() }
+                                                Some(pid) if *pid == peer => "AUTH:OK".to_string(),
+                                                Some(_) => "AUTH:ERR:Username belongs to another peer".to_string(),
+                                                None => { username_to_peer.insert(name.to_string(), peer); "AUTH:OK".to_string() }
                                             }
                                         } else {
-                                            "ERR:Invalid password".to_string()
+                                            "AUTH:ERR:Invalid password".to_string()
                                         }
                                     }
-                                    None => "ERR:Unknown user".to_string(),
+                                    None => "AUTH:ERR:Unknown user".to_string(),
                                 }
                             }
+                        } else if let Some(rest) = text.strip_prefix("LOGOUT:") {
+                            let name = rest.trim();
+                            match username_to_peer.get(name) {
+                                Some(pid) if *pid == peer => {
+                                    username_to_peer.remove(name);
+                                    "AUTH:OK".to_string()
+                                }
+                                Some(_) => "AUTH:ERR:Username belongs to another peer".to_string(),
+                                None => "AUTH:ERR:Unknown user".to_string(),
+                            }
+                        } else if text.trim() == "LIST" {
+                            // Return a mapping of username=peerid for all logged-in users
+                            let mut pairs: Vec<String> = Vec::new();
+                            for (name, pid) in &username_to_peer {
+                                pairs.push(format!("{}={}", name, pid));
+                            }
+                            format!("LIST:{}", pairs.join(","))
                         } else {
-                            "ERR:Unknown auth command".to_string()
+                            "AUTH:ERR:Unknown command".to_string()
                         };
                         if let Err(e) = swarm.behaviour_mut().auth.send_response(channel, resp) {
                             tracing::error!("Failed to send auth response: {}", e);
