@@ -235,10 +235,11 @@ use eframe::egui;
     #[derive(Debug, Clone)]
     enum UiToNet {
         Connect { peer_id: String },
-        Write { peer_id: String, msg: String },
+        Write { peer_id: String, from_username: String, to_username: String, msg: String },
         Register { username: String, password: String, birthdate: String },
         Login { username: String, password: String },
         Logout { username: String },
+        DeleteAccount { username: String, password: String },
     }
 
     // Messages from networking task to UI
@@ -252,6 +253,7 @@ use eframe::egui;
         Error(String),
         AuthResult { ok: bool, message: String },
         Users(HashMap<String, String>), // username -> PeerId
+        DeleteResult { ok: bool, message: String },
     }
 
     fn main() -> eframe::Result<()> {
@@ -305,6 +307,7 @@ use eframe::egui;
     selected_peer_index: Option<usize>,
     users: HashMap<String, String>, // username -> PeerId
     selected_user: Option<String>,
+    peer_to_username: HashMap<String, String>, // PeerId -> username (for labeling incoming)
         message_input: String,
         chat_log: Vec<(String, String)>, // (from, text)
         status: String,
@@ -322,6 +325,11 @@ use eframe::egui;
         reg_birth_year: i32,
         reg_birth_month: u32, // 1-12
         reg_birth_day: u32,   // 1..=days_in_month
+        // Delete account view
+        show_delete_view: bool,
+        del_username: String,
+        del_password: String,
+        del_feedback: String,
     }
 
     // UI pages
@@ -333,9 +341,10 @@ use eframe::egui;
             Self {
                 tx, rx, _rt: rt,
                 known_peers: Vec::new(), selected_peer_index: None,
-                users: HashMap::new(), selected_user: None,
+                users: HashMap::new(), selected_user: None, peer_to_username: HashMap::new(),
                 message_input: String::new(), chat_log: Vec::new(),
                 status: String::from("Please login or register"), logged_in: false,
+                
                 username: String::new(), username_input: String::new(), password_input: String::new(),
                 auth_feedback: String::new(),
                 page: Page::Login,
@@ -344,6 +353,10 @@ use eframe::egui;
                 reg_birth_year: 2000,
                 reg_birth_month: 1,
                 reg_birth_day: 1,
+                show_delete_view: false,
+                del_username: String::new(),
+                del_password: String::new(),
+                del_feedback: String::new(),
             }
         }
     }
@@ -364,11 +377,38 @@ use eframe::egui;
                         ctx.request_repaint();
                     }
                     NetToUi::Connected(pid) => {
-                        self.status = format!("Connected: {}", pid);
+                        // Do not expose peer IDs. Prefer username mapping if available.
+                        let label = self
+                            .peer_to_username
+                            .get(&pid)
+                            .cloned()
+                            .or_else(|| {
+                                // Fallback: try reverse lookup from users map
+                                self.users
+                                    .iter()
+                                    .find_map(|(uname, upid)| if upid == &pid { Some(uname.clone()) } else { None })
+                            });
+                        self.status = match label {
+                            Some(name) => format!("Connected to {}", name),
+                            None => "Connected".to_string(),
+                        };
                         ctx.request_repaint();
                     }
                     NetToUi::Disconnected(pid) => {
-                        self.status = format!("Disconnected: {}", pid);
+                        // Do not expose peer IDs.
+                        let label = self
+                            .peer_to_username
+                            .get(&pid)
+                            .cloned()
+                            .or_else(|| {
+                                self.users
+                                    .iter()
+                                    .find_map(|(uname, upid)| if upid == &pid { Some(uname.clone()) } else { None })
+                            });
+                        self.status = match label {
+                            Some(name) => format!("Disconnected from {}", name),
+                            None => "Disconnected".to_string(),
+                        };
                         ctx.request_repaint();
                     }
                     NetToUi::Incoming { from, text } => {
@@ -399,10 +439,31 @@ use eframe::egui;
                         if !self.username.is_empty() {
                             map.remove(&self.username);
                         }
+                        // Rebuild forward and reverse maps
+                        self.peer_to_username.clear();
+                        for (uname, pid) in &map { self.peer_to_username.insert(pid.clone(), uname.clone()); }
                         self.users = map;
                         // reset selected if missing
                         if let Some(name) = self.selected_user.clone() {
                             if !self.users.contains_key(&name) { self.selected_user = None; }
+                        }
+                        ctx.request_repaint();
+                    }
+                    NetToUi::DeleteResult { ok, message } => {
+                        if ok {
+                            // Reset to login
+                            self.logged_in = false;
+                            self.username.clear();
+                            self.selected_user = None;
+                            self.users.clear();
+                            self.peer_to_username.clear();
+                            self.message_input.clear();
+                            self.chat_log.clear();
+                            self.show_delete_view = false;
+                            self.page = Page::Login;
+                            self.auth_feedback = "Account deleted".to_string();
+                        } else {
+                            self.del_feedback = message;
                         }
                         ctx.request_repaint();
                     }
@@ -577,16 +638,21 @@ use eframe::egui;
             }
 
             egui::TopBottomPanel::top("top").show(ctx, |ui| {
-                // Top bar frame to separate from content
                 egui::Frame::none()
                     .fill(ui.visuals().panel_fill)
                     .inner_margin(egui::Margin::same(8.0))
                     .show(ui, |ui| {
-                        ui.label(&self.status);
-                        ui.separator();
+                        // Row 1: "User: <username>"
                         ui.horizontal(|ui| {
-                            ui.label("User:");
-                            let current = self.selected_user.clone().unwrap_or_else(|| "Select a user".to_string());
+                            let me = if self.username.is_empty() { "(not logged in)".to_string() } else { self.username.clone() };
+                            ui.label(format!("User: {}", me));
+                        });
+                        ui.add_space(6.0);
+                        // Row 2: left = dropdown, right = Account button (stable layout via columns)
+                        ui.columns(2, |cols| {
+                            // Left column: dropdown
+                            let ui = &mut cols[0];
+                            let current = self.selected_user.clone().unwrap_or_else(|| "User to Connect".to_string());
                             egui::ComboBox::from_id_source("user_combo")
                                 .selected_text(current)
                                 .show_ui(ui, |ui| {
@@ -596,16 +662,75 @@ use eframe::egui;
                                         let is_sel = self.selected_user.as_ref().map(|n| n == &name).unwrap_or(false);
                                         if ui.selectable_label(is_sel, &name).clicked() {
                                             self.selected_user = Some(name.clone());
-                                            // attempt connect immediately
+                                            self.status = format!("Connecting to {}...", name);
                                             if let Some(pid) = self.users.get(&name).cloned() {
                                                 let _ = self.tx.send(UiToNet::Connect { peer_id: pid });
                                             }
                                         }
                                     }
                                 });
+
+                            // Right column: Account button aligned to far right
+                            cols[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let w = ui.available_width().min(BUTTON_WIDTH);
+                                if ui.add_sized([w, UI_HEIGHT], egui::Button::new("Account")).clicked() {
+                                    self.show_delete_view = true;
+                                    self.del_username = self.username.clone();
+                                    self.del_password.clear();
+                                    self.del_feedback.clear();
+                                }
+                            });
                         });
                     });
             });
+
+            // Delete account view (modal-like screen that replaces chat when shown)
+            if self.show_delete_view {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(24.0);
+                        ui.heading("Delete Account");
+                        ui.add_space(8.0);
+                        ui.label("Enter your username and password to confirm deletion. This action cannot be undone.");
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.del_username)
+                                .hint_text("Username")
+                                .desired_width(360.0)
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.del_password)
+                                .hint_text("Password")
+                                .password(true)
+                                .desired_width(360.0)
+                        );
+                        ui.add_space(10.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            ui.set_width(360.0);
+                            ui.horizontal(|ui| {
+                                let total = 2.0 * BUTTON_WIDTH + ui.spacing().item_spacing.x;
+                                let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
+                                ui.add_space(left_pad);
+                                let confirm = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Delete Account")).clicked();
+                                let cancel = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Cancel")).clicked();
+                                if confirm {
+                                    if self.del_username.trim().is_empty() || self.del_password.is_empty() {
+                                        self.del_feedback = "Username and password required".to_string();
+                                    } else {
+                                        let _ = self.tx.send(UiToNet::DeleteAccount { username: self.del_username.trim().to_string(), password: self.del_password.clone() });
+                                        self.del_feedback = "Deleting...".to_string();
+                                    }
+                                }
+                                if cancel { self.show_delete_view = false; }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        if !self.del_feedback.is_empty() { ui.colored_label(egui::Color32::YELLOW, &self.del_feedback); }
+                    });
+                });
+                return;
+            }
 
             // Bottom panel: fixed input area with text field and Send button
             // NOTE: Panels strip space in the order they're added. Add the bottom panel BEFORE the CentralPanel
@@ -619,7 +744,7 @@ use eframe::egui;
                         ui.separator();
                         // Right-to-left: button on right, text edit fills remaining space
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let send_clicked = ui
+                            let send_button = ui
                                 .add_sized(
                                     [BUTTON_WIDTH, UI_HEIGHT],
                                     egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
@@ -627,10 +752,33 @@ use eframe::egui;
                                         .rounding(egui::Rounding::same(RADIUS))
                                         .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(230, 130, 0) }),
                                 )
-                                .clicked();
+                                ;
+                            let send_clicked = send_button.clicked();
+                            // we'll refocus the input after it is added below
+                            
 
+                            // If Send was clicked, handle it immediately before touching the text edit state
+                            if send_clicked {
+                                if let Some(name) = self.selected_user.clone() {
+                                    if let Some(peer_id) = self.users.get(&name).cloned() {
+                                        if !self.message_input.is_empty() {
+                                            let _ = self.tx.send(UiToNet::Write { peer_id, from_username: self.username.clone(), to_username: name.clone(), msg: self.message_input.clone() });
+                                            self.message_input.clear();
+                                            // We'll refocus the input field after it's recreated this frame (see below)
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Stable Id for the TextEdit; do NOT change across frames to keep accessibility focus valid
+                            let input_id = egui::Id::new("chat_input");
+                            
+                            // Fixed-size input with internal scrolling
+                            let desired_rows = 6;
                             let text_edit = egui::TextEdit::multiline(&mut self.message_input)
-                                .desired_rows(6) // larger by design
+                                .id_source(input_id)
+                                .desired_rows(desired_rows)
+                                .desired_width(f32::INFINITY) // fill width
                                 .hint_text("Type your message here...")
                                 .frame(false); // we'll draw our own background
 
@@ -640,21 +788,27 @@ use eframe::egui;
                                 .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(55, 61, 69) })
                                 .inner_margin(egui::Margin::symmetric(10.0, 8.0))
                                 .show(ui, |ui| {
-                                    ui.add_sized(ui.available_size(), text_edit)
-                                });
-                            let response = inner.inner; // Response of the TextEdit for focus
+                                    // Fixed widget size: fill width, but enforce a constant height with internal scrolling
+                                    let w = ui.available_width();
+                                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                                    let fixed_h = row_h * 6.0; // 6 rows
+                                    ui.set_min_height(fixed_h);
+                                    ui.set_max_height(fixed_h);
 
-                            if send_clicked {
-                                if let Some(name) = self.selected_user.clone() {
-                                    if let Some(peer_id) = self.users.get(&name).cloned() {
-                                        if !self.message_input.is_empty() {
-                                            let _ = self.tx.send(UiToNet::Write { peer_id, msg: self.message_input.clone() });
-                                            self.message_input.clear();
-                                            ui.memory_mut(|m| m.request_focus(response.id));
-                                        }
-                                    }
-                                }
-                            }
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                        .max_height(fixed_h)
+                                        .show(ui, |ui| {
+                                            ui.set_width(w);
+                                            ui.add(text_edit);
+                                        })
+                                });
+                            let _ = inner.inner; // consume response; focus may be requested below
+
+                            // No focus juggling on send to keep AccessKit tree stable
+
+                            // send_clicked already processed above
                         });
                     });
             });
@@ -728,8 +882,8 @@ use eframe::egui;
         let _ = tx.send(NetToUi::Info("Starting networking...".into()));
 
         let local_key = libp2p::identity::Keypair::generate_ed25519();
-        let local_peer_id = PeerId::from(local_key.public());
-        let _ = tx.send(NetToUi::Info(format!("Local peer id: {}", local_peer_id)));
+    let local_peer_id = PeerId::from(local_key.public());
+    // Intentionally do not send local peer id to UI
 
         let mut swarm = match libp2p::SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
@@ -787,6 +941,8 @@ use eframe::egui;
     let mut connected: HashSet<PeerId> = HashSet::new();
     let mut is_registered = false;
     let mut is_authenticated = false;
+    // Reverse map of PeerId -> username for display of incoming messages
+    let mut peer_to_username_net: HashMap<String, String> = HashMap::new();
 
         // Periodic rediscovery every 5s for a more responsive UI
     let mut rediscover_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -807,14 +963,16 @@ use eframe::egui;
                                 } else { let _=tx.send(NetToUi::Info("Peer not discovered yet".into())); }
                             } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
                         }
-                        UiToNet::Write { peer_id, msg } => {
+                        UiToNet::Write { peer_id, from_username, to_username, msg } => {
                             if let Ok(peer) = PeerId::from_str(&peer_id) {
                                 if !connected.contains(&peer) {
                                     if let Some(addrs) = discovered.get(&peer) { for addr in addrs { let _=swarm.dial(addr.clone()); } }
                                 }
                                 // Echo to local chat window immediately
-                                let _ = tx.send(NetToUi::Incoming { from: format!("You to {}", peer_id), text: msg.clone() });
-                                swarm.behaviour_mut().request_response.send_request(&peer, msg);
+                                let _ = tx.send(NetToUi::Incoming { from: format!("You to {}", to_username), text: msg.clone() });
+                                // Wrap the message with the sender's username so the receiver can always display name
+                                let payload = format!("MSG:{}|{}", from_username, msg);
+                                swarm.behaviour_mut().request_response.send_request(&peer, payload);
                             } else { let _=tx.send(NetToUi::Error("Invalid PeerId".into())); }
                         }
                         UiToNet::Register { username, password, birthdate } => {
@@ -827,6 +985,10 @@ use eframe::egui;
                         }
                         UiToNet::Logout { username } => {
                             let payload = format!("LOGOUT:{}", username);
+                            let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
+                        }
+                        UiToNet::DeleteAccount { username, password } => {
+                            let payload = format!("DELETE:{}|{}", username, password);
                             let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, payload);
                         }
                     }
@@ -849,6 +1011,7 @@ use eframe::egui;
                             // If this was the rendezvous server, clear our user list (will repopulate if we reconnect)
                             if peer_id == rendezvous_point_peer_id {
                                 let _ = tx.send(NetToUi::Users(HashMap::new()));
+                                peer_to_username_net.clear();
                             }
                         }
                         SwarmEvent::Behaviour(ClientBehaviourEvent::Identify(identify::Event::Received { peer_id, info, })) => {
@@ -893,25 +1056,43 @@ use eframe::egui;
                                 match message {
                                     request_response::Message::Request { request, channel, .. } => {
                                         let request_str = request.to_string();
-                                        let _ = tx.send(NetToUi::Incoming { from: peer.to_string(), text: request_str.clone() });
+                                        // Try to parse embedded username: format "MSG:<from_username>|<text>"
+                                        if let Some(rest) = request_str.strip_prefix("MSG:") {
+                                            if let Some((from_name, text)) = rest.split_once('|') {
+                                                // Update reverse map for future lookups and display
+                                                let peer_key = peer.to_string();
+                                                peer_to_username_net.insert(peer_key, from_name.to_string());
+                                                let _ = tx.send(NetToUi::Incoming { from: from_name.to_string(), text: text.to_string() });
+                                            } else {
+                                                // Malformed payload, fallback to known mapping without exposing PeerId
+                                                let peer_key = peer.to_string();
+                                                let from_label = peer_to_username_net.get(&peer_key).cloned().unwrap_or_else(|| "Unknown".to_string());
+                                                let _ = tx.send(NetToUi::Incoming { from: from_label, text: request_str.clone() });
+                                            }
+                                        } else {
+                                            // Backward compatibility: old clients may send plain text. Use mapping if available, otherwise show "Unknown".
+                                            let peer_key = peer.to_string();
+                                            let from_label = peer_to_username_net.get(&peer_key).cloned().unwrap_or_else(|| "Unknown".to_string());
+                                            let _ = tx.send(NetToUi::Incoming { from: from_label, text: request_str.clone() });
+                                        }
                                         // Respond with a small ack so the sender gets a response per message
                                         if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, "ok".to_string()) {
                                             tracing::error!("Failed to send response: {}", e);
                                         }
                                     }
                                     request_response::Message::Response { response, .. } => {
-                                        // Surface responses in the chat too (optional)
-                                        let _ = tx.send(NetToUi::Info(format!("Response from {}: {}", peer, response)));
+                                        // Surface responses without exposing peer id
+                                        let _ = tx.send(NetToUi::Info(format!("Response received: {}", response)));
                                     }
                                 }
                             }
                             request_response::Event::OutboundFailure { peer, error, request_id: _ } => {
                                 tracing::error!("Outbound request to {} failed: {:?}", peer, error);
-                                let _ = tx.send(NetToUi::Error(format!("Outbound to {} failed: {:?}", peer, error)));
+                                let _ = tx.send(NetToUi::Error(format!("Outbound request failed: {:?}", error)));
                             }
                             request_response::Event::InboundFailure { peer, error, request_id: _ } => {
                                 tracing::error!("Inbound with {} failed: {:?}", peer, error);
-                                let _ = tx.send(NetToUi::Error(format!("Inbound with {} failed: {:?}", peer, error)));
+                                let _ = tx.send(NetToUi::Error(format!("Inbound request failed: {:?}", error)));
                             }
                             request_response::Event::ResponseSent { peer, .. } => {
                                 tracing::debug!("Response sent to {}", peer);
@@ -927,22 +1108,29 @@ use eframe::egui;
                                         let _ = tx.send(NetToUi::AuthResult { ok, message: msg });
                                         if ok {
                                             is_authenticated = true;
-                                            // After successful auth, request the user list
-                                            // Send request through auth protocol to the rendezvous server
-                                            // We'll send from here because we have access to swarm
+                                            // After successful auth, request the user list via auth protocol
                                             let _ = swarm.behaviour_mut().auth.send_request(&rendezvous_point_peer_id, "LIST".to_string());
                                         }
                                     } else if let Some(rest) = response.strip_prefix("LIST:") {
                                         // Parse username=peerid pairs separated by commas
                                         let mut map = HashMap::new();
+                                        peer_to_username_net.clear();
                                         if !rest.is_empty() {
                                             for pair in rest.split(',') {
                                                 if let Some((name, pid)) = pair.split_once('=') {
-                                                    map.insert(name.to_string(), pid.to_string());
+                                                    let uname = name.to_string();
+                                                    let pid_str = pid.to_string();
+                                                    map.insert(uname.clone(), pid_str.clone());
+                                                    peer_to_username_net.insert(pid_str, uname);
                                                 }
                                             }
                                         }
                                         let _ = tx.send(NetToUi::Users(map));
+                                    } else if let Some(rest) = response.strip_prefix("DELETE:") {
+                                        // DELETE:OK or DELETE:ERR:reason
+                                        let ok = rest.starts_with("OK");
+                                        let msg = if ok { "Account deleted".to_string() } else { rest.strip_prefix("ERR:").unwrap_or(rest).to_string() };
+                                        let _ = tx.send(NetToUi::DeleteResult { ok, message: msg });
                                     } else {
                                         // Backward-compat: older server without AUTH: prefix
                                         let ok = response.starts_with("OK");

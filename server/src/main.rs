@@ -6,7 +6,7 @@ use libp2p::{
     tcp, yamux,
     PeerId,
 };
-use std::{error::Error, io, collections::HashMap, fs, path::Path};
+use std::{error::Error, io, collections::HashMap, fs, path::{Path, PathBuf}};
 use tracing_subscriber::EnvFilter;
 use serde::{Serialize, Deserialize};
 use sha2::{Sha256, Digest};
@@ -226,8 +226,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Listening on {}", listen_multiaddr_str);
 
     // Persistent user store
-    let users_path = Path::new("users.xml");
-    let mut users_xml = load_users(users_path);
+    // Use a path relative to the server crate directory to be stable across working directories
+    let users_path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("users.xml");
+    let mut users_xml = load_users(&users_path);
     let mut users_by_name: HashMap<String, (String, String)> = HashMap::new();
     for u in &users_xml.users {
         users_by_name.insert(u.username.clone(), (u.password_hash.clone(), u.birthdate.clone()));
@@ -300,14 +301,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // Auth protocol
             SwarmEvent::Behaviour(MyBehaviourEvent::Auth(event)) => match event {
                 request_response::Event::Message { peer, message } => match message {
-                    request_response::Message::Request { request, channel, .. } => {
+                    request_response::Message::Request { request, 
+                        channel, .. } => {
                         let text = request.to_string();
                         // Expect formats:
                         // REGISTER:username|password|YYYY-MM-DD
                         // LOGIN:username|password
                         let resp = if let Some(rest) = text.strip_prefix("REGISTER:") {
                             let parts: Vec<&str> = rest.split('|').collect();
-                            if parts.len() != 3 { "ERR:Invalid register payload".to_string() }
+                            if parts.len() != 3 { "AUTH:ERR:Invalid register payload".to_string() }
                             else {
                                 let name = parts[0].trim().to_string();
                                 let pw = parts[1];
@@ -316,8 +318,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     None => {
                                         let pw_hash = hash_password(pw);
                                         users_by_name.insert(name.clone(), (pw_hash.clone(), dob.clone()));
-                                        users_xml.users.push(UserXml { username: name.clone(), password_hash: pw_hash, birthdate: dob, peer_id: None });
-                                        save_users(users_path, &users_xml);
+                                        users_xml.users.push(UserXml { username: name.clone(), password_hash: pw_hash, birthdate: dob });
+                                        save_users(&users_path, &users_xml);
                                         username_to_peer.insert(name, peer);
                                         "AUTH:OK".to_string()
                                     }
@@ -326,7 +328,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         } else if let Some(rest) = text.strip_prefix("LOGIN:") {
                             let parts: Vec<&str> = rest.split('|').collect();
-                            if parts.len() != 2 { "ERR:Invalid login payload".to_string() }
+                            if parts.len() != 2 { "AUTH:ERR:Invalid login payload".to_string() }
                             else {
                                 let name = parts[0].trim();
                                 let pw = parts[1];
@@ -354,6 +356,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                                 Some(_) => "AUTH:ERR:Username belongs to another peer".to_string(),
                                 None => "AUTH:ERR:Unknown user".to_string(),
+                            }
+                        } else if let Some(rest) = text.strip_prefix("DELETE:") {
+                            // DELETE:username|password
+                            let parts: Vec<&str> = rest.split('|').collect();
+                            if parts.len() != 2 { "DELETE:ERR:Invalid delete payload".to_string() }
+                            else {
+                                let name = parts[0].trim();
+                                let pw = parts[1];
+                                match users_by_name.get(name) {
+                                    Some((hash, _dob)) if *hash == hash_password(pw) => {
+                                        // Remove from in-memory maps
+                                        users_by_name.remove(name);
+                                        username_to_peer.remove(name);
+                                        // Remove from XML list and persist
+                                        users_xml.users.retain(|u| u.username != name);
+                                        save_users(&users_path, &users_xml);
+                                        "DELETE:OK".to_string()
+                                    }
+                                    Some(_) => "DELETE:ERR:Invalid password".to_string(),
+                                    None => "DELETE:ERR:Unknown user".to_string(),
+                                }
                             }
                         } else if text.trim() == "LIST" {
                             // Return a mapping of username=peerid for all logged-in users
@@ -393,6 +416,7 @@ struct MyBehaviour {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename = "users")]
 struct UsersXml {
     #[serde(rename = "user", default)]
     users: Vec<UserXml>,
@@ -406,9 +430,6 @@ struct UserXml {
     password_hash: String,
     #[serde(rename = "birthdate")]
     birthdate: String, // YYYY-MM-DD
-    #[serde(skip)]
-    #[serde(default)]
-    peer_id: Option<PeerId>,
 }
 
 fn hash_password(pw: &str) -> String {
@@ -419,17 +440,16 @@ fn hash_password(pw: &str) -> String {
 }
 
 fn load_users(path: &Path) -> UsersXml {
-    if let Ok(text) = fs::read_to_string(path) {
-        quick_xml::de::from_str::<UsersXml>(&text).unwrap_or_default()
-    } else {
-        UsersXml::default()
+    match fs::read_to_string(path) {
+        Ok(text) => quick_xml::de::from_str::<UsersXml>(&text).unwrap_or_default(),
+        Err(_) => UsersXml::default(),
     }
 }
 
 fn save_users(path: &Path, users: &UsersXml) {
-    if let Ok(xml) = quick_xml::se::to_string(users) {
-        // Store with a simple root header
-        let xml_wrapped = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<users>\n{}\n</users>", xml);
-        let _ = fs::write(path, xml_wrapped);
+    // Serialize with correct root; include XML header
+    if let Ok(xml_body) = quick_xml::se::to_string(users) {
+        let xml_all = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml_body);
+        let _ = fs::write(path, xml_all);
     }
 }
