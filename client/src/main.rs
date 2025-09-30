@@ -5,17 +5,12 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
-use std::{collections::{HashMap, HashSet}, io, str::FromStr};
+use std::{collections::{HashMap, HashSet}, io, str::FromStr, time::SystemTime};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing_subscriber::EnvFilter;
 use eframe::egui;
 
     // ---- UI Theme & Sizing ------------------------------------------------------
-    // Assumptions:
-    // - We standardize interactive widget height across the app (buttons, combo boxes, etc.).
-    // - Primary palette is blue with orange accents (no green hues).
-    // - Multiline chat input remains larger by design (not forced to the standard height).
-
     const UI_HEIGHT: f32 = 36.0; // uniform height for interactive controls
     const BUTTON_WIDTH: f32 = 120.0; // default button width
     const RADIUS: f32 = 8.0; // rounded corners
@@ -67,7 +62,7 @@ use eframe::egui;
         ctx.set_style(style);
     }
 
-    // --- Protocol Definition (Identical to Server) ---
+    // --- Protocol Definition (must match the server) -----------------------------
     const RENDEZVOUS_NAMESPACE: &str = "p2p-client";
 
     #[derive(Debug, Clone)]
@@ -150,7 +145,8 @@ use eframe::egui;
             io.flush().await
         }
     }
-    // --- Auth Protocol Definition ---
+
+    // --- Auth Protocol -----------------------------------------------------------
     #[derive(Debug, Clone)]
     struct AuthProtocol();
 
@@ -158,8 +154,8 @@ use eframe::egui;
     struct AuthCodec();
 
     impl AsRef<str> for AuthProtocol {
-        fn as_ref(&self) -> &str { 
-            "/auth/1.0" 
+        fn as_ref(&self) -> &str {
+            "/auth/1.0"
         }
     }
 
@@ -231,6 +227,7 @@ use eframe::egui;
             io.flush().await
         }
     }
+
     // Messages from UI to networking task
     #[derive(Debug, Clone)]
     enum UiToNet {
@@ -242,13 +239,19 @@ use eframe::egui;
         DeleteAccount { username: String, password: String },
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MessageDirection {
+        Incoming,
+        Outgoing,
+    }
+
     // Messages from networking task to UI
     #[derive(Debug, Clone)]
     enum NetToUi {
         Discovered(Vec<String>),
         Connected(String),
         Disconnected(String),
-        Incoming { from: String, text: String },
+        ChatMessage { peer: String, direction: MessageDirection, text: String },
         Info(String),
         Error(String),
         AuthResult { ok: bool, message: String },
@@ -298,18 +301,39 @@ use eframe::egui;
     }
 
     // The eframe/egui application struct
+    #[derive(Debug, Clone)]
+    struct ChatMessage {
+        from_self: bool,
+        text: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct Conversation {
+        messages: Vec<ChatMessage>,
+        unread: bool,
+        last_activity: SystemTime,
+    }
+
+    impl Default for Conversation {
+        fn default() -> Self {
+            Self {
+                messages: Vec::new(),
+                unread: false,
+                last_activity: SystemTime::UNIX_EPOCH,
+            }
+        }
+    }
+
     struct ChatApp {
         tx: UnboundedSender<UiToNet>,
         rx: UnboundedReceiver<NetToUi>,
         // Hold the runtime to keep it alive for as long as the UI runs
         _rt: std::sync::Arc<tokio::runtime::Runtime>,
-    known_peers: Vec<String>,
-    selected_peer_index: Option<usize>,
-    users: HashMap<String, String>, // username -> PeerId
-    selected_user: Option<String>,
-    peer_to_username: HashMap<String, String>, // PeerId -> username (for labeling incoming)
+    conversations: HashMap<String, Conversation>,
+        users: HashMap<String, String>, // username -> PeerId
+        selected_user: Option<String>,
+        peer_to_username: HashMap<String, String>, // PeerId -> username (for labeling incoming)
         message_input: String,
-        chat_log: Vec<(String, String)>, // (from, text)
         status: String,
         // Login state
         logged_in: bool,
@@ -340,9 +364,9 @@ use eframe::egui;
         fn new(tx: UnboundedSender<UiToNet>, rx: UnboundedReceiver<NetToUi>, rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
             Self {
                 tx, rx, _rt: rt,
-                known_peers: Vec::new(), selected_peer_index: None,
+                conversations: HashMap::new(),
                 users: HashMap::new(), selected_user: None, peer_to_username: HashMap::new(),
-                message_input: String::new(), chat_log: Vec::new(),
+                message_input: String::new(),
                 status: String::from("Please login or register"), logged_in: false,
                 
                 username: String::new(), username_input: String::new(), password_input: String::new(),
@@ -369,11 +393,7 @@ use eframe::egui;
             while let Ok(msg) = self.rx.try_recv() {
                 match msg {
                     NetToUi::Discovered(list) => {
-                        self.known_peers = list.clone();
-                        // reset selection if out of range
-                        if let Some(i) = self.selected_peer_index {
-                            if i >= self.known_peers.len() { self.selected_peer_index = None; }
-                        }
+                        self.status = format!("Discovered {} peer(s)", list.len());
                         ctx.request_repaint();
                     }
                     NetToUi::Connected(pid) => {
@@ -411,8 +431,16 @@ use eframe::egui;
                         };
                         ctx.request_repaint();
                     }
-                    NetToUi::Incoming { from, text } => {
-                        self.chat_log.push((from, text));
+                    NetToUi::ChatMessage { peer, direction, text } => {
+                        let entry = self.conversations.entry(peer.clone()).or_default();
+                        let from_self = matches!(direction, MessageDirection::Outgoing);
+                        entry.messages.push(ChatMessage { from_self, text });
+                        entry.last_activity = SystemTime::now();
+                        if from_self || self.selected_user.as_ref() == Some(&peer) {
+                            entry.unread = false;
+                        } else {
+                            entry.unread = true;
+                        }
                         ctx.request_repaint();
                     }
                     NetToUi::Info(s) => self.status = s,
@@ -442,7 +470,11 @@ use eframe::egui;
                         // Rebuild forward and reverse maps
                         self.peer_to_username.clear();
                         for (uname, pid) in &map { self.peer_to_username.insert(pid.clone(), uname.clone()); }
+                        self.conversations.retain(|user, _| map.contains_key(user));
                         self.users = map;
+                        for name in self.users.keys() {
+                            self.conversations.entry(name.clone()).or_default();
+                        }
                         // reset selected if missing
                         if let Some(name) = self.selected_user.clone() {
                             if !self.users.contains_key(&name) { self.selected_user = None; }
@@ -458,7 +490,7 @@ use eframe::egui;
                             self.users.clear();
                             self.peer_to_username.clear();
                             self.message_input.clear();
-                            self.chat_log.clear();
+                            self.conversations.clear();
                             self.show_delete_view = false;
                             self.page = Page::Login;
                             self.auth_feedback = "Account deleted".to_string();
@@ -637,43 +669,89 @@ use eframe::egui;
                 return;
             }
 
-            egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            // Account deletion modal takes over the layout when toggled
+            if self.show_delete_view {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(24.0);
+                        ui.heading("Delete Account");
+                        ui.label("Enter your credentials to permanently delete your account.");
+                        ui.add_space(12.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.del_username)
+                                .hint_text("Username")
+                                .desired_width(360.0),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.del_password)
+                                .hint_text("Password")
+                                .password(true)
+                                .desired_width(360.0),
+                        );
+                        ui.add_space(12.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            ui.set_width(360.0);
+                            ui.horizontal(|ui| {
+                                let total = 2.0 * BUTTON_WIDTH + ui.spacing().item_spacing.x;
+                                let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
+                                ui.add_space(left_pad);
+                                let confirm = ui
+                                    .add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Delete"))
+                                    .clicked();
+                                let cancel = ui
+                                    .add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Cancel"))
+                                    .clicked();
+                                if confirm {
+                                    if self.del_username.trim().is_empty() || self.del_password.is_empty() {
+                                        self.del_feedback = "Username and password required".to_string();
+                                    } else {
+                                        let _ = self.tx.send(UiToNet::DeleteAccount {
+                                            username: self.del_username.trim().to_string(),
+                                            password: self.del_password.clone(),
+                                        });
+                                        self.del_feedback = "Deleting account...".to_string();
+                                    }
+                                }
+                                if cancel {
+                                    self.show_delete_view = false;
+                                    self.del_feedback.clear();
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        if !self.del_feedback.is_empty() {
+                            ui.colored_label(egui::Color32::YELLOW, &self.del_feedback);
+                        }
+                    });
+                });
+                return;
+            }
+
+            let mut logout_requested = false;
+
+            egui::TopBottomPanel::top("chat_top_bar").show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::same(8.0))
+                    .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
-                        // Row 1: "User: <username>"
                         ui.horizontal(|ui| {
-                            let me = if self.username.is_empty() { "(not logged in)".to_string() } else { self.username.clone() };
-                            ui.label(format!("User: {}", me));
-                        });
-                        ui.add_space(6.0);
-                        // Row 2: left = dropdown, right = Account button (stable layout via columns)
-                        ui.columns(2, |cols| {
-                            // Left column: dropdown
-                            let ui = &mut cols[0];
-                            let current = self.selected_user.clone().unwrap_or_else(|| "User to Connect".to_string());
-                            egui::ComboBox::from_id_source("user_combo")
-                                .selected_text(current)
-                                .show_ui(ui, |ui| {
-                                    let mut names: Vec<String> = self.users.keys().cloned().collect();
-                                    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-                                    for name in names {
-                                        let is_sel = self.selected_user.as_ref().map(|n| n == &name).unwrap_or(false);
-                                        if ui.selectable_label(is_sel, &name).clicked() {
-                                            self.selected_user = Some(name.clone());
-                                            self.status = format!("Connecting to {}...", name);
-                                            if let Some(pid) = self.users.get(&name).cloned() {
-                                                let _ = self.tx.send(UiToNet::Connect { peer_id: pid });
-                                            }
-                                        }
-                                    }
-                                });
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&self.username).heading());
+                                ui.label(egui::RichText::new(&self.status).small());
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Logout"))
+                                    .clicked()
+                                {
+                                    logout_requested = true;
+                                }
 
-                            // Right column: Account button aligned to far right
-                            cols[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let w = ui.available_width().min(BUTTON_WIDTH);
-                                if ui.add_sized([w, UI_HEIGHT], egui::Button::new("Account")).clicked() {
+                                if ui
+                                    .add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Account"))
+                                    .clicked()
+                                {
                                     self.show_delete_view = true;
                                     self.del_username = self.username.clone();
                                     self.del_password.clear();
@@ -684,185 +762,245 @@ use eframe::egui;
                     });
             });
 
-            // Delete account view (modal-like screen that replaces chat when shown)
-            if self.show_delete_view {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(24.0);
-                        ui.heading("Delete Account");
-                        ui.add_space(8.0);
-                        ui.label("Enter your username and password to confirm deletion. This action cannot be undone.");
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.del_username)
-                                .hint_text("Username")
-                                .desired_width(360.0)
-                        );
-                        ui.add_space(6.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.del_password)
-                                .hint_text("Password")
-                                .password(true)
-                                .desired_width(360.0)
-                        );
-                        ui.add_space(10.0);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                            ui.set_width(360.0);
-                            ui.horizontal(|ui| {
-                                let total = 2.0 * BUTTON_WIDTH + ui.spacing().item_spacing.x;
-                                let left_pad = (ui.available_width() - total).max(0.0) / 2.0;
-                                ui.add_space(left_pad);
-                                let confirm = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Delete Account")).clicked();
-                                let cancel = ui.add_sized([BUTTON_WIDTH, UI_HEIGHT], egui::Button::new("Cancel")).clicked();
-                                if confirm {
-                                    if self.del_username.trim().is_empty() || self.del_password.is_empty() {
-                                        self.del_feedback = "Username and password required".to_string();
-                                    } else {
-                                        let _ = self.tx.send(UiToNet::DeleteAccount { username: self.del_username.trim().to_string(), password: self.del_password.clone() });
-                                        self.del_feedback = "Deleting...".to_string();
-                                    }
-                                }
-                                if cancel { self.show_delete_view = false; }
-                            });
-                        });
-                        ui.add_space(6.0);
-                        if !self.del_feedback.is_empty() { ui.colored_label(egui::Color32::YELLOW, &self.del_feedback); }
+            if logout_requested {
+                if !self.username.is_empty() {
+                    let _ = self.tx.send(UiToNet::Logout {
+                        username: self.username.clone(),
                     });
-                });
+                }
+                self.logged_in = false;
+                self.username.clear();
+                self.username_input.clear();
+                self.password_input.clear();
+                self.selected_user = None;
+                self.users.clear();
+                self.peer_to_username.clear();
+                self.message_input.clear();
+                self.conversations.clear();
+                self.status = "Logged out".to_string();
+                self.page = Page::Login;
+                self.auth_feedback.clear();
+                self.show_delete_view = false;
                 return;
             }
 
-            // Bottom panel: fixed input area with text field and Send button
-            // NOTE: Panels strip space in the order they're added. Add the bottom panel BEFORE the CentralPanel
-            // so the CentralPanel gets the remaining space and won't be overlapped.
-            egui::TopBottomPanel::bottom("input_panel").show(ctx, |ui| {
-                // Bottom input area with spacing and rounded corners
+            egui::SidePanel::left("chat_sidebar")
+                .resizable(false)
+                .min_width(260.0)
+                .show(ctx, |ui| {
+                    ui.heading("Chats");
+                    ui.add_space(8.0);
+
+                    if self.users.is_empty() {
+                        ui.label("No peers available yet. Stay tuned while discovery runs...");
+                    }
+
+                    let mut names: Vec<String> = self.users.keys().cloned().collect();
+                    names.sort_by(|a, b| {
+                        let convo_a = self.conversations.get(a);
+                        let convo_b = self.conversations.get(b);
+
+                        let unread_a = convo_a.map(|c| c.unread).unwrap_or(false);
+                        let unread_b = convo_b.map(|c| c.unread).unwrap_or(false);
+                        let time_a = convo_a.map(|c| c.last_activity).unwrap_or(SystemTime::UNIX_EPOCH);
+                        let time_b = convo_b.map(|c| c.last_activity).unwrap_or(SystemTime::UNIX_EPOCH);
+
+                        unread_b
+                            .cmp(&unread_a)
+                            .then_with(|| time_b.cmp(&time_a))
+                            .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+                    });
+
+                    for name in names {
+                        let conversation = self.conversations.get(&name);
+                        let preview = conversation
+                            .and_then(|conv| conv.messages.last())
+                            .map(|msg| {
+                                let prefix = if msg.from_self { "You" } else { name.as_str() };
+                                format!("{}: {}", prefix, truncate_preview(&msg.text))
+                            })
+                            .unwrap_or_else(|| "No messages yet".to_string());
+
+                        let is_selected = self
+                            .selected_user
+                            .as_ref()
+                            .map(|selected| selected == &name)
+                            .unwrap_or(false);
+                        let is_unread = conversation.map(|c| c.unread).unwrap_or(false);
+
+                        let desired_size = egui::vec2(ui.available_width(), 70.0);
+                        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+                        let mut visuals = ui.style().interact_selectable(&response, is_selected);
+                        if is_unread && !is_selected {
+                            visuals.bg_fill = egui::Color32::from_rgb(56, 142, 60);
+                            visuals.bg_stroke = egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(67, 160, 71) };
+                        }
+                        ui.painter().rect(
+                            rect,
+                            egui::Rounding::same(RADIUS),
+                            visuals.bg_fill,
+                            visuals.bg_stroke,
+                        );
+
+                        let inner = rect.shrink2(egui::vec2(12.0, 10.0));
+                        let mut child_ui = ui.child_ui(inner, egui::Layout::top_down(egui::Align::LEFT));
+                        child_ui.label(egui::RichText::new(&name).strong());
+                        child_ui.label(egui::RichText::new(preview).small());
+
+                        if response.clicked() {
+                            let conv = self.conversations.entry(name.clone()).or_default();
+                            conv.unread = false;
+                            if self.selected_user.as_ref() != Some(&name) {
+                                self.selected_user = Some(name.clone());
+                                self.status = format!("Connecting to {}...", name);
+                                if let Some(pid) = self.users.get(&name).cloned() {
+                                    let _ = self.tx.send(UiToNet::Connect { peer_id: pid });
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+
+            let selected_user = self.selected_user.clone();
+
+            egui::TopBottomPanel::bottom("chat_input_panel").show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::same(8.0))
+                    .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
                         ui.separator();
-                        // Right-to-left: button on right, text edit fills remaining space
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let send_button = ui
-                                .add_sized(
-                                    [BUTTON_WIDTH, UI_HEIGHT],
-                                    egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
-                                        .fill(egui::Color32::from_rgb(255, 152, 0)) // accent orange
-                                        .rounding(egui::Rounding::same(RADIUS))
-                                        .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(230, 130, 0) }),
-                                )
-                                ;
-                            let send_clicked = send_button.clicked();
-                            // we'll refocus the input after it is added below
-                            
+                        let can_chat = selected_user.is_some();
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(can_chat, |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let send_clicked = ui
+                                    .add_sized(
+                                        [BUTTON_WIDTH, UI_HEIGHT],
+                                        egui::Button::new(egui::RichText::new("Send").color(egui::Color32::WHITE))
+                                            .fill(egui::Color32::from_rgb(255, 152, 0))
+                                            .rounding(egui::Rounding::same(RADIUS))
+                                            .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(230, 130, 0) }),
+                                    )
+                                    .clicked();
 
-                            // If Send was clicked, handle it immediately before touching the text edit state
-                            if send_clicked {
-                                if let Some(name) = self.selected_user.clone() {
-                                    if let Some(peer_id) = self.users.get(&name).cloned() {
-                                        if !self.message_input.is_empty() {
-                                            let _ = self.tx.send(UiToNet::Write { peer_id, from_username: self.username.clone(), to_username: name.clone(), msg: self.message_input.clone() });
-                                            self.message_input.clear();
-                                            // We'll refocus the input field after it's recreated this frame (see below)
+                                let input_id = egui::Id::new("chat_input_field");
+                                let text_edit = egui::TextEdit::multiline(&mut self.message_input)
+                                    .id_source(input_id)
+                                    .desired_rows(5)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Type a message...")
+                                    .frame(false);
+
+                                let inner = egui::Frame::none()
+                                    .fill(egui::Color32::from_rgb(38, 43, 50))
+                                    .rounding(egui::Rounding::same(RADIUS))
+                                    .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(55, 61, 69) })
+                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                    .show(ui, |ui| {
+                                        let w = ui.available_width();
+                                        let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                                        let fixed_h = row_h * 5.0;
+                                        ui.set_min_height(fixed_h);
+                                        ui.set_max_height(fixed_h);
+
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                            .max_height(fixed_h)
+                                            .show(ui, |ui| {
+                                                ui.set_width(w);
+                                                ui.add(text_edit);
+                                            });
+                                    });
+                                let _ = inner.inner;
+
+                                if send_clicked {
+                                    if let Some(name) = selected_user.clone() {
+                                        if let Some(peer_id) = self.users.get(&name).cloned() {
+                                            let message = self.message_input.trim();
+                                            if !message.is_empty() {
+                                                let message = message.to_string();
+                                                let _ = self.tx.send(UiToNet::Write {
+                                                    peer_id,
+                                                    from_username: self.username.clone(),
+                                                    to_username: name.clone(),
+                                                    msg: message,
+                                                });
+                                                self.message_input.clear();
+                                            }
                                         }
                                     }
                                 }
-                            }
-
-                            // Stable Id for the TextEdit; do NOT change across frames to keep accessibility focus valid
-                            let input_id = egui::Id::new("chat_input");
-                            
-                            // Fixed-size input with internal scrolling
-                            let desired_rows = 6;
-                            let text_edit = egui::TextEdit::multiline(&mut self.message_input)
-                                .id_source(input_id)
-                                .desired_rows(desired_rows)
-                                .desired_width(f32::INFINITY) // fill width
-                                .hint_text("Type your message here...")
-                                .frame(false); // we'll draw our own background
-
-                            let inner = egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(38, 43, 50)) // stylish grey background
-                                .rounding(egui::Rounding::same(RADIUS))
-                                .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(55, 61, 69) })
-                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                .show(ui, |ui| {
-                                    // Fixed widget size: fill width, but enforce a constant height with internal scrolling
-                                    let w = ui.available_width();
-                                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                                    let fixed_h = row_h * 6.0; // 6 rows
-                                    ui.set_min_height(fixed_h);
-                                    ui.set_max_height(fixed_h);
-
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                                        .max_height(fixed_h)
-                                        .show(ui, |ui| {
-                                            ui.set_width(w);
-                                            ui.add(text_edit);
-                                        })
-                                });
-                            let _ = inner.inner; // consume response; focus may be requested below
-
-                            // No focus juggling on send to keep AccessKit tree stable
-
-                            // send_clicked already processed above
+                            });
                         });
+                        if !can_chat {
+                            ui.label("Select a conversation to start chatting.");
+                        }
                     });
             });
 
-            // Central panel: only the scrollable chat area (with visible scrollbar and stick-to-bottom)
             egui::CentralPanel::default().show(ctx, |ui| {
-                // Make the central panel occupy the full available width so the scroll bar sits at the edge
                 ui.set_width(ui.available_width());
-                ui.heading("Chat");
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        // Ensure the inner content also uses the full width
-                        ui.set_min_width(ui.available_width());
-                        for (from, text) in &self.chat_log {
-                            let is_outgoing = from.starts_with("You to ");
-                            if is_outgoing {
-                                // Right-aligned outgoing bubble in blue, white text
-                                let row_width = ui.available_width();
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(row_width, 0.0),
-                                    egui::Layout::right_to_left(egui::Align::Min),
-                                    |ui| {
+                ui.add_space(8.0);
+                if let Some(name) = selected_user {
+                    ui.heading(&name);
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_source("chat_scroll")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            if let Some(conversation) = self.conversations.get(&name) {
+                                for msg in &conversation.messages {
+                                    let row_width = ui.available_width();
+                                    let layout = if msg.from_self {
+                                        egui::Layout::right_to_left(egui::Align::Min)
+                                    } else {
+                                        egui::Layout::left_to_right(egui::Align::Min)
+                                    };
+                                    ui.allocate_ui_with_layout(egui::vec2(row_width, 0.0), layout, |ui| {
+                                        let (fill, stroke) = if msg.from_self {
+                                            (
+                                                egui::Color32::from_rgb(25, 118, 210),
+                                                egui::Color32::from_rgb(21, 101, 192),
+                                            )
+                                        } else {
+                                            (
+                                                egui::Color32::from_rgb(38, 43, 50),
+                                                egui::Color32::from_rgb(55, 61, 69),
+                                            )
+                                        };
                                         egui::Frame::none()
-                                            .fill(egui::Color32::from_rgb(25, 118, 210))
+                                            .fill(fill)
                                             .rounding(egui::Rounding::same(RADIUS))
-                                            .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(21, 101, 192) })
-                                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                            .stroke(egui::Stroke { width: 1.0, color: stroke })
+                                            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
                                             .show(ui, |ui| {
-                                                ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                                                    ui.colored_label(egui::Color32::WHITE, format!("{}:", from));
-                                                    ui.colored_label(egui::Color32::WHITE, text);
-                                                });
+                                                let author = if msg.from_self { "You" } else { name.as_str() };
+                                                ui.colored_label(egui::Color32::WHITE, egui::RichText::new(author).small());
+                                                ui.add_space(2.0);
+                                                ui.colored_label(egui::Color32::WHITE, &msg.text);
                                             });
-                                    },
-                                );
-                            } else {
-                                // Left-aligned incoming bubble, same blue background as outgoing
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(25, 118, 210))
-                                    .rounding(egui::Rounding::same(RADIUS))
-                                    .stroke(egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(21, 101, 192) })
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                    .show(ui, |ui| {
-                                        ui.colored_label(egui::Color32::WHITE, format!("{}:", from));
-                                        ui.colored_label(egui::Color32::WHITE, text);
                                     });
+                                    ui.add_space(6.0);
+                                }
+                            } else {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(40.0);
+                                    ui.label("No messages yet. Say hi!");
+                                });
                             }
-                            ui.add_space(4.0);
-                        }
+                        });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.heading("No chat selected");
+                        ui.label("Pick a user from the left to begin chatting.");
                     });
+                }
             });
         }
 
@@ -969,7 +1107,11 @@ use eframe::egui;
                                     if let Some(addrs) = discovered.get(&peer) { for addr in addrs { let _=swarm.dial(addr.clone()); } }
                                 }
                                 // Echo to local chat window immediately
-                                let _ = tx.send(NetToUi::Incoming { from: format!("You to {}", to_username), text: msg.clone() });
+                                let _ = tx.send(NetToUi::ChatMessage {
+                                    peer: to_username.clone(),
+                                    direction: MessageDirection::Outgoing,
+                                    text: msg.clone(),
+                                });
                                 // Wrap the message with the sender's username so the receiver can always display name
                                 let payload = format!("MSG:{}|{}", from_username, msg);
                                 swarm.behaviour_mut().request_response.send_request(&peer, payload);
@@ -1062,18 +1204,30 @@ use eframe::egui;
                                                 // Update reverse map for future lookups and display
                                                 let peer_key = peer.to_string();
                                                 peer_to_username_net.insert(peer_key, from_name.to_string());
-                                                let _ = tx.send(NetToUi::Incoming { from: from_name.to_string(), text: text.to_string() });
+                                                let _ = tx.send(NetToUi::ChatMessage {
+                                                    peer: from_name.to_string(),
+                                                    direction: MessageDirection::Incoming,
+                                                    text: text.to_string(),
+                                                });
                                             } else {
                                                 // Malformed payload, fallback to known mapping without exposing PeerId
                                                 let peer_key = peer.to_string();
                                                 let from_label = peer_to_username_net.get(&peer_key).cloned().unwrap_or_else(|| "Unknown".to_string());
-                                                let _ = tx.send(NetToUi::Incoming { from: from_label, text: request_str.clone() });
+                                                let _ = tx.send(NetToUi::ChatMessage {
+                                                    peer: from_label.clone(),
+                                                    direction: MessageDirection::Incoming,
+                                                    text: request_str.clone(),
+                                                });
                                             }
                                         } else {
                                             // Backward compatibility: old clients may send plain text. Use mapping if available, otherwise show "Unknown".
                                             let peer_key = peer.to_string();
                                             let from_label = peer_to_username_net.get(&peer_key).cloned().unwrap_or_else(|| "Unknown".to_string());
-                                            let _ = tx.send(NetToUi::Incoming { from: from_label, text: request_str.clone() });
+                                            let _ = tx.send(NetToUi::ChatMessage {
+                                                peer: from_label,
+                                                direction: MessageDirection::Incoming,
+                                                text: request_str.clone(),
+                                            });
                                         }
                                         // Respond with a small ack so the sender gets a response per message
                                         if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, "ok".to_string()) {
@@ -1175,6 +1329,24 @@ use eframe::egui;
         identify: identify::Behaviour,
         request_response: request_response::Behaviour<HelloCodec>,
         auth: request_response::Behaviour<AuthCodec>,
+    }
+
+    fn truncate_preview(text: &str) -> String {
+        const MAX_LEN: usize = 48;
+        let mut cleaned = String::with_capacity(text.len());
+        for ch in text.chars() {
+            if ch == '\n' {
+                cleaned.push(' ');
+            } else {
+                cleaned.push(ch);
+            }
+            if cleaned.len() >= MAX_LEN {
+                cleaned.truncate(MAX_LEN);
+                cleaned.push('…');
+                return cleaned;
+            }
+        }
+        cleaned
     }
 
     // --- Utilities for Register date picker ---
